@@ -1,6 +1,7 @@
 import math
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 def mask_to_x0(mask,num_classes):
 	'''
@@ -122,6 +123,53 @@ class GaussianDiffusion:
 			x_t = self.p_sample(x_t,t,t_index,cond_image)
 
 		return x_t
+
+
+	@torch.no_grad()
+	def ddim_sample(self,cond_image,mask_channels=1):
+		'''
+		Denoising Diffusion Implicit Models (DDIM) Song et al. (2020).
+		Reverse process sampling with skipped timesteps for faster validation. 
+		'''
+		S = 50
+		sub_steps = np.linspace(0, self.timesteps - 1, S, dtype=int)
+
+		# Extract the alpha_bars for your validation sequence
+		alphas_bar_sub = self.alphas_cumprod[sub_steps]
+
+		# Prepend a 1.0 for the final step (t=0 requires alpha_bar_{t-1} which is 1.0)
+		alphas_bar_sub_prev = torch.cat([torch.ones(1, device=self.alphas_cumprod.device), alphas_bar_sub[:-1]])
+
+		B, _, H, W = cond_image.shape
+    
+	    # Start with pure noise (same shape as target mask, e.g., [B, C, 256, 256])
+	    x_t = torch.randn((B,num_classes,H,W), device=conditioning_image.device)
+    
+		# Loop backwards through the 50 selected steps
+		for i in reversed(range(len(sub_steps))):
+			t_index = sub_steps[i]
+
+			# Create a batch-wide tensor for the current actual timestep
+			t_tensor = torch.full((B,), t_index, device=x_t.device, dtype=torch.long)
+
+			# 1. Predict the noise using your U-Net conditioned on the image
+			predicted_noise = self.model(x_t, t_tensor, cond_image)
+
+			alpha_bar = alphas_bar_sub[i]
+			alpha_bar_prev = alphas_bar_sub_prev[i]
+
+			# 2. Mathematically estimate x_0 (the final clean mask logits)
+			pred_x0 = (x_t - torch.sqrt(1 - alpha_bar) * predicted_noise) / torch.sqrt(alpha_bar)
+
+			# 3. Calculate the direction pointing to x_t-1
+			dir_xt = torch.sqrt(1 - alpha_bar_prev) * predicted_noise
+
+			# 4. Deterministic jump to the next step in your sub-sequence
+			x_t = torch.sqrt(alpha_bar_prev) * pred_x0 + dir_xt
+        
+	    # 'x' now contains your final clean segmentation logits after only 50 steps!
+	    return x_t 
+
 
 
 if __name__ == '__main__':
