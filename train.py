@@ -12,7 +12,7 @@ import inspect
 
 from model import S2SegDiff
 from diffusion import GaussianDiffusion, mask_to_x0, x0_to_mask
-from dataloader import SentinelDataset
+from fast_dataloader import FastSentinelDataset, FastTrainTransform, GPUGaussianNoise, GPUNormalize
 
 
 class Logger():
@@ -181,7 +181,7 @@ def parse_args():
 	# DEFINITION
 	parser = argparse.ArgumentParser()
 	required = parser.add_argument_group('Required arguments')
-	required.add_argument('--data-dir',required=True,help='Input dataset directory.')
+	required.add_argument('--data-dir',required=True,help='Cache directory with training/ and validation/ built by fast_dataloader.py.')
 	required.add_argument('--net-dir',required=True,help='Output dir for trained model weights.')
 	required.add_argument('--log-dir',required=True,help='Output dir for training logs.')
 	required.add_argument('-p','--params',required=True,help='JSON hyperparameter file.')
@@ -211,7 +211,7 @@ def parse_args():
 	return args
 
 
-def train(model,diffusion,loader,optimizer,scheduler,device,n_classes=2):
+def train(model,diffusion,loader,optimizer,scheduler,device,normalize,noise=None,n_classes=2):
 
 	loss_sum   = torch.zeros(1,device=device)
 	model.train()
@@ -220,6 +220,9 @@ def train(model,diffusion,loader,optimizer,scheduler,device,n_classes=2):
 
 		rgb = rgb.to(device,non_blocking=True)
 		lbl = lbl.to(device,non_blocking=True)
+		# if noise is not None:
+			# rgb = noise(rgb) # training augmentation (noise part), on the 0-255 scale
+		rgb = normalize(rgb)
 
 		x0  = mask_to_x0(lbl,n_classes)
 		t   = torch.randint(0,diffusion.timesteps,(rgb.shape[0],),device=device,dtype=torch.long)
@@ -238,7 +241,7 @@ def train(model,diffusion,loader,optimizer,scheduler,device,n_classes=2):
 	return loss_sum.item()/len(loader.dataset)
 
 @torch.no_grad()
-def validate(model,diffusion,loader,device,n_classes=2):
+def validate(model,diffusion,loader,device,normalize,n_classes=2):
 	'''
 	Noise-prediction (MSE) loss over the full validation set.
 	'''
@@ -247,7 +250,7 @@ def validate(model,diffusion,loader,device,n_classes=2):
 
 	for rgb,lbl in loader:
 
-		rgb = rgb.to(device,non_blocking=True)
+		rgb = normalize(rgb.to(device,non_blocking=True))
 		lbl = lbl.to(device,non_blocking=True)
 
 		x0 = mask_to_x0(lbl,n_classes)
@@ -261,7 +264,7 @@ def validate(model,diffusion,loader,device,n_classes=2):
 
 
 @torch.no_grad()
-def validate_sampling(model,diffusion,loader,device,n_classes=2,seed=0):
+def validate_sampling(model,diffusion,loader,device,normalize,n_classes=2,seed=0):
 	'''
 	Segmentation metrics from DDIM-sampled masks, on a fixed subset of the validation set.
 	The sampling noise uses a fixed seed on a forked RNG, so every evaluation sees the
@@ -277,7 +280,7 @@ def validate_sampling(model,diffusion,loader,device,n_classes=2,seed=0):
 
 		for rgb,lbl in loader:
 
-			rgb = rgb.to(device,non_blocking=True)
+			rgb = normalize(rgb.to(device,non_blocking=True))
 			lbl = lbl.to(device,non_blocking=True)
 
 			with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
@@ -314,8 +317,15 @@ def train_and_validate(args):
 		fused=device.type == 'cuda') # single fused kernel for the whole update
 
 	# DATASETS
-	train_dataset = SentinelDataset(f"{args.data_dir}/training",n_bands=hp['bands'],n_labels=n_classes,transform=None)
-	valid_dataset = SentinelDataset(f"{args.data_dir}/validation",n_bands=hp['bands'],n_labels=n_classes,transform=None)
+	# uint8 CHIPS FROM THE .npy CACHE; NORMALIZATION (AND TRAINING NOISE) ON THE GPU
+	train_dataset = FastSentinelDataset(f"{args.data_dir}/training",transform=None) # transform=FastTrainTransform() to augment
+	valid_dataset = FastSentinelDataset(f"{args.data_dir}/validation",transform=None)
+	for ds in (train_dataset,valid_dataset):
+		assert ds.n_bands == hp['bands'] and ds.n_labels == n_classes, \
+			f"Cache {ds.cache_dir} has bands={ds.n_bands}, labels={ds.n_labels}; hyperparameters need bands={hp['bands']}, labels={n_classes}"
+
+	normalize = GPUNormalize(train_dataset.mean,train_dataset.std,device)
+	noise     = None # GPUGaussianNoise() to augment (use together with FastTrainTransform)
 
 	# DATALOADERS
 	loader_kwargs = {
@@ -370,9 +380,9 @@ def train_and_validate(args):
 
 		# TRAIN & VALIDATE
 		start_time = time.perf_counter()
-		train_loss = train(model,diffusion,train_dloader,optimizer,scheduler,device,n_classes=n_classes)
+		train_loss = train(model,diffusion,train_dloader,optimizer,scheduler,device,normalize,noise=noise,n_classes=n_classes)
 		print(f"Epoch {epoch}: train_loss={train_loss:.5f}")
-		valid_loss = validate(model,diffusion,valid_dloader,device,n_classes=n_classes)
+		valid_loss = validate(model,diffusion,valid_dloader,device,normalize,n_classes=n_classes)
 		print(f"Epoch {epoch}: valid_loss={valid_loss:.5f}")
 		train_time = time.perf_counter() - start_time
 		print(f"Train+validation time: {train_time:.2f} secs.")
@@ -381,7 +391,7 @@ def train_and_validate(args):
 		sample_metrics = (epoch+1) % 5 == 0
 		if sample_metrics:
 			sampling_start_time = time.perf_counter()
-			ce_loss,valid_cmat = validate_sampling(model,diffusion,sample_dloader,device,n_classes=n_classes)
+			ce_loss,valid_cmat = validate_sampling(model,diffusion,sample_dloader,device,normalize,n_classes=n_classes)
 			sampling_time = time.perf_counter() - sampling_start_time
 			va_metrics = calculate_metrics(valid_cmat.cpu())
 		else:
