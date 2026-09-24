@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from torch.utils.flop_counter import FlopCounterMode
 
@@ -83,11 +84,16 @@ class MultiHeadSelfAttention(nn.Module):
 		K = K.view(B,N,self.num_heads,self.head_dim).transpose(1,2)
 		V = V.view(B,N,self.num_heads,self.head_dim).transpose(1,2)
 
-		attn = (Q @ K.transpose(-2, -1)) # [B,num_heads,N,N]
-		attn = attn / (self.head_dim ** 0.5)
-		attn = attn.softmax(dim=-1)
+		# softmax(QK^T/sqrt(H))V with fused flash/memory-efficient kernels: the [N,N] attention
+		# matrix is never stored, so memory grows ~linearly (not quadratically) with N
+		x = F.scaled_dot_product_attention(Q,K,V) # [B,num_heads,N,H]
 
-		x = attn @ V # [B,num_heads,N,H]
+		# PREVIOUS (EXPLICIT) VERSION -- stores the full [B,num_heads,N,N] attention matrix
+		# attn = (Q @ K.transpose(-2, -1)) # [B,num_heads,N,N]
+		# attn = attn / (self.head_dim ** 0.5)
+		# attn = attn.softmax(dim=-1)
+		# x = attn @ V # [B,num_heads,N,H]
+
 		x = x.transpose(1, 2).reshape(B,N,self.E) #[B,num_heads,N,H] -> [B,N,num_heads,H] -> [B,N,E]
 		return self.W_o(x) # [B,N,E]
 
@@ -136,10 +142,14 @@ class CrossAttention(nn.Module):
 		K = K.view(B,M,self.num_heads,self.head_dim).transpose(1,2)
 		V = V.view(B,M,self.num_heads,self.head_dim).transpose(1,2)
 
-		attn = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5) # [B,num_heads,N,M]
-		attn = attn.softmax(dim=-1)
+		# softmax(QK^T/sqrt(H))V without storing the [N,M] attention matrix
+		x = F.scaled_dot_product_attention(Q,K,V) # [B,num_heads,N,H]
 
-		x = attn @ V # [B,num_heads,N,H]
+		# PREVIOUS (EXPLICIT) VERSION -- stores the full [B,num_heads,N,M] attention matrix
+		# attn = (Q @ K.transpose(-2, -1)) / (self.head_dim ** 0.5) # [B,num_heads,N,M]
+		# attn = attn.softmax(dim=-1)
+		# x = attn @ V # [B,num_heads,N,H]
+
 		x = x.transpose(1, 2).reshape(B,N,self.E)
 		return self.W_o(x)
 
@@ -435,17 +445,113 @@ class S2SegDiff(nn.Module):
 ################################################################################
 # SOME UTILITY FUNCTIONS
 ################################################################################
-def get_model_memory_footprint():
-	pass
+def get_model_memory_footprint(model,H=256,W=256,batch_size=1,backward=True,bf16=True):
+	'''
+	Peak GPU memory (bytes) of one forward pass (and backward, if backward=True) of S2SegDiff
+	on [batch_size,C,H,W] inputs, measured with torch.cuda.max_memory_allocated().
+	Includes weights, activations and gradients; bf16=True runs under bf16 autocast like train.py.
+	Does not include optimizer state (AdamW: 2x the parameter bytes) unless it is already allocated.
+	Requires the model on a CUDA device.
+	'''
+	model  = model._orig_mod if hasattr(model,'_orig_mod') else model # unwrap torch.compile
+	device = next(model.parameters()).device
+	if device.type != 'cuda':
+		raise ValueError(f"get_model_memory_footprint needs the model on a CUDA device, got '{device}'")
 
-def get_model_parameter_size():
-	pass
+	x_t,t,rgb = _dummy_inputs(model,H,W,batch_size)
 
-def count_flops():
-	pass
+	torch.cuda.synchronize(device)
+	torch.cuda.empty_cache()
+	torch.cuda.reset_peak_memory_stats(device)
+
+	use_bf16 = bf16 and torch.cuda.is_bf16_supported()
+	with torch.set_grad_enabled(backward), torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=use_bf16):
+		out = model(x_t,t,rgb)
+	if backward:
+		out.float().sum().backward()
+
+	torch.cuda.synchronize(device)
+	peak = torch.cuda.max_memory_allocated(device)
+
+	if backward:
+		model.zero_grad(set_to_none=True)
+	return peak
+
+
+def get_model_parameter_size(model,trainable_only=False):
+	'''
+	Number of parameters in the model (only those with requires_grad if trainable_only).
+	'''
+	model = model._orig_mod if hasattr(model,'_orig_mod') else model # unwrap torch.compile
+	return sum(p.numel() for p in model.parameters() if p.requires_grad or not trainable_only)
+
+
+def count_flops(model,H=256,W=256,batch_size=1,backward=False):
+	'''
+	FLOPs of one forward pass (and backward, if backward=True) of S2SegDiff on
+	[batch_size,C,H,W] inputs, counted with torch.utils.flop_counter.FlopCounterMode.
+	Input channels are read from the model's input layers. One multiply-add = 2 FLOPs.
+	'''
+	model     = model._orig_mod if hasattr(model,'_orig_mod') else model # unwrap torch.compile
+	x_t,t,rgb = _dummy_inputs(model,H,W,batch_size)
+
+	flop_counter = FlopCounterMode(display=False)
+	with torch.set_grad_enabled(backward), flop_counter:
+		out = model(x_t,t,rgb)
+		if backward:
+			out.sum().backward()
+	if backward:
+		model.zero_grad(set_to_none=True)
+
+	return flop_counter.get_total_flops()
+
+
+def _dummy_inputs(model,H,W,batch_size):
+	'''
+	Random (x_t,t,rgb) inputs for S2SegDiff on the model's device.
+	Input channels are read from the model's input layers.
+	'''
+	device        = next(model.parameters()).device
+	mask_channels = model.in_layer.in_channels
+	in_channels   = model.cond_encoder.in_layer.in_channels
+	x_t = torch.randn(batch_size,mask_channels,H,W,device=device)
+	t   = torch.randint(0,1000,(batch_size,),device=device)
+	rgb = torch.randn(batch_size,in_channels,H,W,device=device)
+	return x_t,t,rgb
 
 ################################################################################
 # MAIN
 ################################################################################
 if __name__ == '__main__':
-	pass
+	# MODEL SIZE / COST SUMMARY FOR ONE CONFIGURATION
+	cfg = {
+		'bands':4,
+		'labels':2,
+		'channels':32,
+		'cnn_layers':2,
+		'vit_layers':1,
+		'mlp_ratio':4,
+		'size':256, # chip height/width
+		'batch':32
+	}
+
+	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+	model  = S2SegDiff(model_id=0,mask_channels=cfg['labels'],in_channels=cfg['bands'],cnn_layers=cfg['cnn_layers'],
+						vit_layers=cfg['vit_layers'],channels=cfg['channels'],mlp_ratio=cfg['mlp_ratio']).to(device)
+
+	n_params = get_model_parameter_size(model)
+	fwd      = count_flops(model,H=cfg['size'],W=cfg['size'],batch_size=1)
+	fwd_bwd  = count_flops(model,H=cfg['size'],W=cfg['size'],batch_size=1,backward=True)
+
+	print(f"S2SegDiff: bands={cfg['bands']} labels={cfg['labels']} channels={cfg['channels']} cnn_layers={cfg['cnn_layers']} "
+		f"vit_layers={cfg['vit_layers']} mlp_ratio={cfg['mlp_ratio']} | input {cfg['size']}x{cfg['size']}")
+	print(f"  parameters:          {n_params:,} ({n_params*4/2**20:.1f} MiB in float32)")
+	print(f"  FLOPs per chip:      forward {fwd/1e9:.1f} G | forward+backward {fwd_bwd/1e9:.1f} G")
+	print(f"  FLOPs per batch {cfg['batch']}: training step {cfg['batch']*fwd_bwd/1e12:.2f} T")
+
+	if device.type == 'cuda':
+		peak = get_model_memory_footprint(model,H=cfg['size'],W=cfg['size'],batch_size=cfg['batch'],backward=True)
+		print(f"  peak GPU memory, training step at batch {cfg['batch']}: {peak/2**30:.2f} GiB "
+			f"(+{2*n_params*4/2**30:.2f} GiB AdamW state)")
+	else:
+		print("  peak GPU memory:     skipped (no CUDA device)")
