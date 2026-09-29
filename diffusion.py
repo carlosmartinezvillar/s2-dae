@@ -3,18 +3,30 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
+def mask_channels(num_classes):
+	'''
+	Channels of x0 for a given number of classes. Binary masks use a single
+	channel (a one-hot pair is redundant: c0 = -c1); multi-class uses one-hot.
+	'''
+	return 1 if num_classes == 2 else num_classes
+
+
 def mask_to_x0(mask,num_classes):
 	'''
-	Mask to [B,C,H,W] in range [-1,1]
+	Mask [B,H,W] to [B,C,H,W] in range [-1,1], C = mask_channels(num_classes)
 	'''
+	if num_classes == 2:
+		return mask.float().unsqueeze(1) * 2 - 1
 	one_hot = F.one_hot(mask.long(), num_classes).permute(0, 3, 1, 2).float()
 	return one_hot * 2 - 1
 
 
 def x0_to_mask(x0):
 	'''
-	Denoised x0 [B,2,H,W] -> [B,H,W]
+	Denoised x0 [B,C,H,W] -> [B,H,W]. Threshold at 0 if C == 1, else argmax.
 	'''
+	if x0.shape[1] == 1:
+		return (x0[:,0] > 0).long()
 	return x0.argmax(dim=1)
 
 
@@ -177,7 +189,7 @@ if __name__ == '__main__':
 	train_set = SentinelDataset(chip_dir,n_bands=3,n_labels=2,transform=None,mask_dir=None)
 	rgb,mask  = train_set[100]                            # [3,H,W], [H,W]
 
-	x0    = mask_to_x0(mask.unsqueeze(0),num_classes=2) # [1,2,H,W]
+	x0    = mask_to_x0(mask.unsqueeze(0),num_classes=2) # [1,1,H,W]
 	noise = torch.randn_like(x0)
 	ts    = [0,100,250,500,750,999]
 

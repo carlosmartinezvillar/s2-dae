@@ -535,8 +535,9 @@ if __name__ == '__main__':
 		'batch':32
 	}
 
+	from diffusion import mask_channels
 	device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-	model  = S2SegDiff(model_id=0,mask_channels=cfg['labels'],in_channels=cfg['bands'],cnn_layers=cfg['cnn_layers'],
+	model  = S2SegDiff(model_id=0,mask_channels=mask_channels(cfg['labels']),in_channels=cfg['bands'],cnn_layers=cfg['cnn_layers'],
 						vit_layers=cfg['vit_layers'],channels=cfg['channels'],mlp_ratio=cfg['mlp_ratio']).to(device)
 
 	n_params = get_model_parameter_size(model)

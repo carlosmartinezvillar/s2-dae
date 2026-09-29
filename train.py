@@ -11,7 +11,7 @@ import json
 import inspect
 
 from model import S2SegDiff
-from diffusion import GaussianDiffusion, mask_to_x0, x0_to_mask
+from diffusion import GaussianDiffusion, mask_to_x0, x0_to_mask, mask_channels
 from fast_dataloader import FastSentinelDataset, FastTrainTransform, GPUGaussianNoise, GPUNormalize
 
 
@@ -141,12 +141,15 @@ def update_confusion_matrix(confmat,T,Y,n_classes):
 def calculate_cross_entropy(x0_pred, true_mask, eps=1e-6):
 	'''
 	Pixel-wise cross-entropy of the sampled x0 against the true mask.
-	x0_pred: [B,num_classes,H,W] in [-1,1] (soft one-hot, see mask_to_x0); 
-	true_mask: [B,H,W] integer class map.
-	x0_pred is mapped back to [0,1]; its log is passed as logits, so cross_entropy's softmax
-	renormalizes it over classes into per-pixel probabilities.
+	x0_pred: [B,C,H,W] in [-1,1] (see mask_to_x0); true_mask: [B,H,W] integer class map.
+	x0_pred is mapped back to [0,1]. If C == 1 it is the foreground probability (binary CE);
+	otherwise its log is passed as logits, so cross_entropy's softmax renormalizes it over
+	classes into per-pixel probabilities.
 	Returns a 0-d tensor on x0_pred's device (no .item(), so no GPU-CPU sync).
 	'''
+	if x0_pred.shape[1] == 1:
+		probs = ((x0_pred[:,0] + 1) / 2).clamp(eps,1-eps)
+		return F.binary_cross_entropy(probs, true_mask.float())
 	probs = ((x0_pred + 1) / 2).clamp(min=eps)
 	return F.cross_entropy(torch.log(probs), true_mask.long())
 
@@ -213,15 +216,15 @@ def parse_args():
 
 def train(model,diffusion,loader,optimizer,scheduler,device,normalize,noise=None,n_classes=2):
 
-	loss_sum   = torch.zeros(1,device=device)
+	loss_sum = torch.zeros(1,device=device)
+	samp_sum = torch.zeros(1,device=device)
 	model.train()
 
 	for rgb,lbl in loader:
 
 		rgb = rgb.to(device,non_blocking=True)
 		lbl = lbl.to(device,non_blocking=True)
-		# if noise is not None:
-			# rgb = noise(rgb) # training augmentation (noise part), on the 0-255 scale
+		# rgb = normalize(noise(rgb)) # training augmentation (noise part), on the 0-255 scale
 		rgb = normalize(rgb)
 
 		x0  = mask_to_x0(lbl,n_classes)
@@ -234,11 +237,13 @@ def train(model,diffusion,loader,optimizer,scheduler,device,normalize,noise=None
 		loss.backward()
 		torch.nn.utils.clip_grad_norm_(model.parameters(),max_norm=1.0)
 		optimizer.step()
-		scheduler.step() # per-batch: linear warmup, then constant
 
 		loss_sum += loss.detach() * rgb.size(0)
+		samp_sum += rgb.size(0)
 
-	return loss_sum.item()/len(loader.dataset)
+	scheduler.step()
+
+	return (loss_sum/samp_sum).item()
 
 @torch.no_grad()
 def validate(model,diffusion,loader,device,normalize,n_classes=2):
@@ -247,6 +252,7 @@ def validate(model,diffusion,loader,device,normalize,n_classes=2):
 	'''
 	model.eval()
 	mse_loss_sum = torch.zeros(1,device=device)
+	samp_sum     = torch.zeros(1,device=device)
 
 	for rgb,lbl in loader:
 
@@ -259,8 +265,9 @@ def validate(model,diffusion,loader,device,normalize,n_classes=2):
 		with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
 			mse_loss = diffusion.p_loss(x0,rgb,t)
 		mse_loss_sum += mse_loss.detach() * rgb.size(0)
+		samp_sum     += rgb.size(0)
 
-	return mse_loss_sum.item()/len(loader.dataset)
+	return (mse_loss_sum/samp_sum).item()
 
 
 @torch.no_grad()
@@ -272,8 +279,8 @@ def validate_sampling(model,diffusion,loader,device,normalize,n_classes=2,seed=0
 	'''
 	model.eval()
 	ce_loss_sum = torch.zeros(1,device=device)
+	samp_sum    = torch.zeros(1,device=device)
 	gpu_cmat    = torch.zeros((n_classes,n_classes),device=device,dtype=torch.int64)
-	# use_bf16    = device.type == 'cuda' and torch.cuda.is_bf16_supported()
 
 	with torch.random.fork_rng(devices=[device] if device.type == 'cuda' else []):
 		torch.manual_seed(seed)
@@ -284,13 +291,14 @@ def validate_sampling(model,diffusion,loader,device,normalize,n_classes=2,seed=0
 			lbl = lbl.to(device,non_blocking=True)
 
 			with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
-				# x0_pred = diffusion.p_sample_loop(rgb,mask_channels=n_classes)
-				x0_pred = diffusion.ddim_sample_loop(rgb,mask_channels=n_classes)
+				# x0_pred = diffusion.p_sample_loop(rgb,mask_channels=mask_channels(n_classes))
+				x0_pred = diffusion.ddim_sample_loop(rgb,mask_channels=mask_channels(n_classes))
 			pred_mask = x0_to_mask(x0_pred)
 			ce_loss_sum += calculate_cross_entropy(x0_pred.float(),lbl) * rgb.size(0)
+			samp_sum    += rgb.size(0)
 			update_confusion_matrix(gpu_cmat,lbl,pred_mask,n_classes)
 
-	return ce_loss_sum.item()/len(loader.dataset), gpu_cmat
+	return (ce_loss_sum/samp_sum).item(), gpu_cmat.cpu()
 
 
 def train_and_validate(args):
@@ -302,7 +310,7 @@ def train_and_validate(args):
 		set_seed(hp['seed'])
 
 	n_classes = hp['labels']
-	model = S2SegDiff(model_id=hp['id'],mask_channels=n_classes,in_channels=hp['bands'],cnn_layers=hp['cnn_layers'],
+	model = S2SegDiff(model_id=hp['id'],mask_channels=mask_channels(n_classes),in_channels=hp['bands'],cnn_layers=hp['cnn_layers'],
 						vit_layers=hp['vit_layers'],channels=hp['channels'],mlp_ratio=hp['mlp_ratio'])
 	model = model.to(device)
 	model = torch.compile(model,mode='reduce-overhead') # CUDA graphs: fewer kernel launches per forward
@@ -358,10 +366,30 @@ def train_and_validate(args):
 		**loader_kwargs)
 
 	# LRATE SCHEDULER -- LINEAR WARMUP OVER 5 EPOCHS (STEPPED PER BATCH), THEN CONSTANT LR
-	warmup_steps = 5*len(train_dloader)
-	scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step: min(1.0,(step+1)/warmup_steps))
+	# warmup_steps = 5*len(train_dloader)
+	# scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step: min(1.0,(step+1)/warmup_steps))
 	# LINEAR WARMUP OVER 1000 OPTIMIZER STEPS, THEN CONSTANT LR
 	# scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step: min(1.0,(step+1)/1000))
+	# COMBINED SCHEDULER
+	warmup_steps = 5
+	cosine_steps = (hp['epochs'] - warmup_steps) // 1
+	warmup_sched = torch.optim.lr_scheduler.LinearLR(
+		optimizer,
+		start_factor=1e-2,
+		end_factor=1.0,
+		total_iters=warmup_steps
+	)
+	cosine_sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+		optimizer,
+		T_0=cosine_steps,
+		T_mult=1,
+		eta_min=0.0)
+	scheduler = torch.optim.lr_scheduler.SequentialLR(
+		optimizer,
+		schedulers=[warmup_sched,cosine_sched],
+		milestones=[warmup_steps]
+	)
+
 
 	# FORWARD + REVERSE DIFFUSION
 	diffusion = GaussianDiffusion(model,timesteps=1000,device=device)
@@ -393,7 +421,7 @@ def train_and_validate(args):
 			sampling_start_time = time.perf_counter()
 			ce_loss,valid_cmat = validate_sampling(model,diffusion,sample_dloader,device,normalize,n_classes=n_classes)
 			sampling_time = time.perf_counter() - sampling_start_time
-			va_metrics = calculate_metrics(valid_cmat.cpu())
+			va_metrics = calculate_metrics(valid_cmat)
 		else:
 			ce_loss    = float('nan')
 			va_metrics = {k:torch.full((n_classes,),float('nan')) for k in ('ppv','tpr','acc','iou','dice')}
