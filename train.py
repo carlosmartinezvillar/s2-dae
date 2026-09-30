@@ -392,7 +392,7 @@ def train_and_validate(args):
 
 
 	# FORWARD + REVERSE DIFFUSION
-	diffusion = GaussianDiffusion(model,timesteps=1000,device=device)
+	diffusion = GaussianDiffusion(model,timesteps=1000,ddim_steps=100,device=device)
 
 	# LOG PATHS/BUFFERS
 	log_file_path = f'{args.log_dir}/epochs_{model.model_id:03}.tsv'
