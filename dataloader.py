@@ -6,6 +6,47 @@ import torchvision.transforms as v1
 import torchvision.transforms.v2 as v2
 import glob
 import os
+import tifffile as tiff
+import numpy as np
+
+
+MEAN = torch.tensor([123.305154,132.731427,131.599954,115.507302]).view(-1,1,1)
+STDD = torch.tensor([53.223368,51.529520,53.707588,55.610260]).view(-1,1,1)
+
+################################################################################
+# FUNCTIONS/HELPERS
+################################################################################
+def build_cached_dataset(chip_dir,cache_dir,split):
+
+	# splits = ("training","validation","testing")
+
+	band_files = sorted(glob.glob(f"{chip_dir}/{split}/*_B0X.tif"))
+	chips = [i[0:-8] for i in band_files]
+	n = len(chips)
+
+	# BUFFER
+	vnir = np.lib.format.open_memmap(f"{cache_dir}/{split}_bands.npy",mode='w+',dtype=np.uint8,shape=(n,4,256,256))
+	mask = np.lib.format.open_memmap(f"{cache_dir}/{split}_masks.npy",mode='w+',dtype=np.uint8,shape=(n,256,256))
+
+	for i,c in enumerate(chips):
+		vnir[i] = tiff.imread(f"{chip_dir}/{split}/{c}_B0X.tif")
+		mask[i] = tiff.imread(f"{chip_dir}/{split}/{c}_LBL.tif")
+
+	for arr in (vnir,mask):
+		arr.flush()
+
+	print(f"Cached bands written to {cache_dir}/{split}_bands.npy")
+	print(f"Cached labels written to {cache_dir}/{split}_masks.npy")
+
+	with open(f"{cache_dir}/{split}_ids.txt","w") as fp:
+		fp.write('\n'.join(chips))
+
+
+def load_cached_split(cache_dir,split):
+	vnir = np.load(f"{cache_dir}/{split}_bands.npy")
+	mask = np.load(f"{cache_dir}/{split}_masks.npy")
+	return vnir,mask
+
 
 ################################################################################
 # CLASSES
@@ -27,16 +68,15 @@ class TrainTransform:
 			])
 		])
 
-		self.intensity = v2.Compose([
-			v2.GaussianNoise(mean=0,sigma=0.02*255,clip=False)
-		])
+		# self.intensity = v2.Compose([
+			# v2.GaussianNoise(mean=0,sigma=0.02*255,clip=False)
+		# ])
 
 
 	def __call__(self,image,label):
 		image, label = self.geometric(image,label)
-		image        = self.intensity(image)
+		# image        = self.intensity(image)
 		return image, label
-
 
 
 class SentinelDataset(torch.utils.data.Dataset):
@@ -146,3 +186,59 @@ class SentinelDataset(torch.utils.data.Dataset):
 			return image,label,distmap
 		else:
 			return image,label
+
+
+class SentinelFastDataset(torch.utils.data.Dataset):
+
+	# splits = ("training","validation","testing")
+
+	def __init__(self,bands_ndarray,masks_ndarray,transform=None):
+		self.bands = torch.from_numpy(bands_ndarray)
+		self.masks = torch.from_numpy(masks_ndarray)
+		self.n    = self.bands.shape[0]
+		self.transform = transform
+		self.mean = MEAN
+		self.stdd = STDD
+
+	def __len__(self):
+		return self.n
+
+	def __getitem__(self,idx):
+		vnir = self.bands[idx]
+		mask = self.masks[idx]
+
+		vnir = tv_tensors.Image(vnir.to(torch.float32))
+		mask = tv_tensors.Mask(torch.squeeze(mask,0).div(255,rounding_mode='floor').to(torch.int64))
+
+		if self.transform():
+			vnir,mask = self.transform(vnir,mask)
+
+		vnir = (vnir-self.mean) / self.stdd
+
+		return vnir,mask
+
+
+class TwinFastDataset(torch.utils.data.Dataset):
+	def __init__(self,bands_ndarray,transform):
+		self.bands = torch.from_numpy(bands_ndarray)
+		self.n     = self.bands.shape[0]
+		self.mean = MEAN
+		self.stdd = STDD
+		self.transform = transform
+
+	def __len__(self):
+		return self.n
+
+	def __getitem__(self,idx):
+		vnir = self.bands[idx]
+		vnir = tv_tensors.Image(vnir.to(torch.float32))
+		vnir = self.transform(vnir)
+		vnir = (vnir-self.mean)/self.stdd
+		return vnir
+
+
+if __name__ == '__main__':
+	args.data_dir = None
+	args.cache_dir = None
+	split = None
+	build_cached_dataset(args.data_dir,args.cache_dir,split)

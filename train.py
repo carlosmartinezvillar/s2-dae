@@ -1,4 +1,5 @@
 import os
+import math
 import random
 import numpy as np
 import torch
@@ -15,7 +16,13 @@ from diffusion import GaussianDiffusion, mask_to_x0, x0_to_mask
 from fast_dataloader import FastSentinelDataset, FastTrainTransform, GPUGaussianNoise, GPUNormalize
 
 
-class Logger():
+class DiffusionLogger():
+
+
+class BTLogger():
+	
+
+class SegmentationLogger():
 	def __init__(self,path,n_classes=2):
 		'''
 		path: str
@@ -234,7 +241,7 @@ def train(model,diffusion,loader,optimizer,scheduler,device,normalize,noise=None
 		loss.backward()
 		torch.nn.utils.clip_grad_norm_(model.parameters(),max_norm=1.0)
 		optimizer.step()
-		scheduler.step() # per-batch: linear warmup, then constant
+		scheduler.step() # per-batch: linear warmup, then cosine annealing
 
 		loss_sum += loss.detach() * rgb.size(0)
 
@@ -357,11 +364,15 @@ def train_and_validate(args):
 		shuffle=False,
 		**loader_kwargs)
 
-	# LRATE SCHEDULER -- LINEAR WARMUP OVER 5 EPOCHS (STEPPED PER BATCH), THEN CONSTANT LR
+	# LRATE SCHEDULER -- LINEAR WARMUP OVER 5 EPOCHS, THEN A SINGLE COSINE CYCLE DOWN TO 0 (STEPPED PER BATCH)
 	warmup_steps = 5*len(train_dloader)
-	scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step: min(1.0,(step+1)/warmup_steps))
-	# LINEAR WARMUP OVER 1000 OPTIMIZER STEPS, THEN CONSTANT LR
-	# scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step: min(1.0,(step+1)/1000))
+	total_steps  = hp['epochs']*len(train_dloader)
+	def lr_lambda(step):
+		if step < warmup_steps:
+			return (step+1)/warmup_steps
+		progress = (step-warmup_steps)/max(1,total_steps-warmup_steps)
+		return 0.5*(1.0+math.cos(math.pi*min(1.0,progress)))
+	scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lr_lambda)
 
 	# FORWARD + REVERSE DIFFUSION
 	diffusion = GaussianDiffusion(model,timesteps=1000,device=device)

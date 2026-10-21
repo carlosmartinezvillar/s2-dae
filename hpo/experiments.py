@@ -39,9 +39,9 @@ def search_lr_and_decay():
 			'lrate':lr,
 			'decay':wd,
 			'batch':32,
-			'vit_layers':1,
-			'mlp_ratio':4,
-			'cnn_layers':2,
+			'vit_layers':2,
+			'mlp_ratio':5,
+			'cnn_layers':3,
 			'channels':32
 		}
 

@@ -254,7 +254,7 @@ class ConditionedViTBlock(nn.Module):
 
 
 ################################################################################
-# Encoder(s)
+# DENOISING ENCODERS
 ################################################################################
 class ViTEncoder(nn.Module):
 	'''
@@ -288,43 +288,8 @@ class ViTEncoder(nn.Module):
 		return [enc_1,enc_2,enc_3,enc_4], enc_5
 
 
-class ConditionEncoder(nn.Module):
-	'''
-	Encoder for RGB inputs.
-	'''
-	def __init__(self,in_channels=3,channels=32,cnn_layers=2):
-		super().__init__()
-		down_config = {'kernel_size': 3, 'stride': 2,'padding': 1, 'bias': True}
-
-		self.in_layer = nn.Conv2d(in_channels,channels,3,1,1,bias=True)
-
-		# [H,W]
-		self.stage_1 = ConvBlock(channels,depth=cnn_layers)
-		self.down_1  = nn.Conv2d(channels,channels*2,**down_config)
-		# [H/2,W/2]
-		self.stage_2 = ConvBlock(channels*2,depth=cnn_layers)
-		self.down_2  = nn.Conv2d(channels*2,channels*4,**down_config)
-		# [H/4,W/4]
-		self.stage_3 = ConvBlock(channels*4,depth=cnn_layers)
-		self.down_3  = nn.Conv2d(channels*4,channels*8,**down_config)
-		# [H/8,W/8]
-		self.stage_4 = ConvBlock(channels*8,depth=cnn_layers)
-		self.down_4  = nn.Conv2d(channels*8,channels*16,**down_config)
-		# [H/16,W/16]
-		self.stage_5 = ConvBlock(channels*16,depth=cnn_layers)
-
-	def forward(self,x):
-		x = self.in_layer(x)
-		x  = self.stage_1(x)
-		x  = self.stage_2(self.down_1(x))
-		c3 = self.stage_3(self.down_2(x))
-		c4 = self.stage_4(self.down_3(c3))
-		c5 = self.stage_5(self.down_4(c4))
-		return c3,c4,c5
-
-
 ################################################################################
-# Decoder
+# DENOISING DECODERS
 ################################################################################
 class ViTDecoder(nn.Module):
 	'''
@@ -363,6 +328,44 @@ class ViTDecoder(nn.Module):
 		dec_4 = self.decoder_4(self.ch_mix_4( torch.cat([enc_2,self.up_3(dec_3)],dim=1) ),t_emb)
 		dec_5 = self.decoder_5(self.ch_mix_5( torch.cat([enc_1,self.up_4(dec_4)],dim=1) ),t_emb)
 		return dec_5
+
+
+################################################################################
+# CONDITION/ALIGNMENT ENCODERS
+###############################################################################
+class ConditionEncoder(nn.Module):
+	'''
+	Encoder for RGB inputs.
+	'''
+	def __init__(self,in_channels=3,channels=32,cnn_layers=2):
+		super().__init__()
+		down_config = {'kernel_size': 3, 'stride': 2,'padding': 1, 'bias': True}
+
+		self.in_layer = nn.Conv2d(in_channels,channels,3,1,1,bias=True)
+
+		# [H,W]
+		self.stage_1 = ConvBlock(channels,depth=cnn_layers)
+		self.down_1  = nn.Conv2d(channels,channels*2,**down_config)
+		# [H/2,W/2]
+		self.stage_2 = ConvBlock(channels*2,depth=cnn_layers)
+		self.down_2  = nn.Conv2d(channels*2,channels*4,**down_config)
+		# [H/4,W/4]
+		self.stage_3 = ConvBlock(channels*4,depth=cnn_layers)
+		self.down_3  = nn.Conv2d(channels*4,channels*8,**down_config)
+		# [H/8,W/8]
+		self.stage_4 = ConvBlock(channels*8,depth=cnn_layers)
+		self.down_4  = nn.Conv2d(channels*8,channels*16,**down_config)
+		# [H/16,W/16]
+		self.stage_5 = ConvBlock(channels*16,depth=cnn_layers)
+
+	def forward(self,x):
+		x = self.in_layer(x)
+		x  = self.stage_1(x)
+		x  = self.stage_2(self.down_1(x))
+		c3 = self.stage_3(self.down_2(x))
+		c4 = self.stage_4(self.down_3(c3))
+		c5 = self.stage_5(self.down_4(c4))
+		return c3,c4,c5
 
 
 ################################################################################
@@ -405,7 +408,7 @@ class TimeEmbedding(nn.Module):
 
 
 ################################################################################
-# MODEL
+# MODELS
 ################################################################################
 class S2SegDiff(nn.Module):
 
@@ -440,6 +443,15 @@ class S2SegDiff(nn.Module):
 		skips,enc_out = self.encoder(x,t_emb,context)
 		dec_out       = self.decoder(enc_out,skips,t_emb,context)
 		return self.out_layer(dec_out)
+
+
+class UnconditionedDenoiser(nn.Module):
+
+	def __init__(self):
+		super().__init__()
+
+	def forward(self,x):
+		pass
 
 
 ################################################################################
