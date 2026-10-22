@@ -13,102 +13,10 @@ import inspect
 
 from model import S2SegDiff
 from diffusion import GaussianDiffusion, mask_to_x0, x0_to_mask, mask_channels
-from fast_dataloader import FastSentinelDataset, FastTrainTransform, GPUGaussianNoise, GPUNormalize
 
 
-class DiffusionLogger():
-
-
-class BTLogger():
-	
-
-class SegmentationLogger():
-	def __init__(self,path,n_classes=2):
-		'''
-		path: str
-			The file path to the text file where we log.
-
-		head: [str]
-			The column names to be included.
-		'''
-		self.path = path
-		self.n_classes = n_classes
-
-		header = ['tloss','vloss','closs']
-		per_class = ('acc','tpr','ppv','iou','dice')
-		for prefix in per_class:
-			header += [f'{prefix}_{c}' for c in range(n_classes)]
-
-		self.header = header
-		self.per_class = per_class
-
-		with open(self.path,'w') as fp:
-			fp.write('\t'.join(header)+'\n')
-
-	def log(self,metrics):
-		'''
-		metrics: Dict
-		'''
-		# line = '\t'.join([f'{_:.5f}' for _ in stats])
-
-		row = [f"{metrics['tloss']:.5f}",f"{metrics['vloss']:.5f}",f"{metrics['closs']:.5f}"]
-		for prefix in self.per_class:
-			row += [f'{metrics[prefix][c]:.5f}' for c in range(self.n_classes)]
-
-		with open(self.path,'a') as fp:
-			fp.write('\t'.join(row) + '\n')
-
-
-class RecentBestTracker:
-	'''
-	Keeps track of 'n' .pth checkpoints saved as best. 
-	Updates queue and removes files no longer needed.
-	'''
-
-	def __init__(self,n=3):
-		self.n = n
-		self.paths = [] #FIFO queue for best 3 recent
-
-	def update(self,path):
-		self.paths.append(path)
-		if len(self.paths) > self.n:
-			old_path = self.paths.pop(0)
-			if os.path.exists(old_path):
-				os.remove(old_path)	
-
-	def epochs(self):
-		return ", ".join([p.split('_')[-1][1:3] for p in self.paths])
-
-
-def save_checkpoint(path,model,optim,epoch,tag):
-	'''
-	Saves model+optim+scaler state as .pth.tar 
-	'''
-	save_path = f'{path}/{tag}_{model.model_id:03}_e{epoch:02}.pth.tar'
-
-	# SAVE UNCOMPILED IF ALREAD COMPILED
-	raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
-
-	# SET CHECKPOINT AND WRITE
-	checkpoint = {'epoch': epoch,
-					'model_state_dict': raw_model.state_dict(),
-					'optim_state_dict': optim.state_dict()}
-	torch.save(checkpoint,save_path)
-
-	# RETURN PATH STR
-	return save_path
-
-
-def set_seed(seed,cuda=True):
-	np.random.seed(seed)
-	random.seed(seed)
-	torch.manual_seed(seed)
-	if torch.cuda.is_available():
-		torch.cuda.manual_seed(seed)  # If using CUDA
-		torch.cuda.manual_seed_all(seed)  # If using multiple GPUs
-		torch.backends.cudnn.deterministic = True
-		torch.backends.cudnn.benchmark = False #Am I losing speed here?
-	os.environ['PYTHONHASHSEED'] = str(seed)
+def load_checkpoint(model,path):
+	pass
 
 
 @torch.no_grad()
@@ -161,29 +69,6 @@ def calculate_cross_entropy(x0_pred, true_mask, eps=1e-6):
 	return F.cross_entropy(torch.log(probs), true_mask.long())
 
 
-def load_hyperparameters(args,print=False):
-	# LOAD FILE
-	with open(args.params,'r') as fp:
-		hp_list = [json.loads(line) for line in fp.readlines() if line != "\n"]
-	assert len(hp_list) > 0, f"Got empty file for {args.params}"
-
-	# SET IDs AS KEYS and CHECK
-	hp_list_indexed = {row['id']:row for row in hp_list}
-	assert args.id in hp_list_indexed, f"model id '{args.id}' not in hyperparameter file {args.params}"
-
-	# SET DICT FOR CURRENT MODEL
-	hp_final = hp_list_indexed[args.id]
-
-	# CHECK DICT -- missing
-	pass
-
-	# PRINT
-	if print:
-		pass
-
-	return hp_final
-
-
 def parse_args():
 	'''
 	Load args.
@@ -215,30 +100,29 @@ def parse_args():
 	assert args.gpu >= 0, f"Got negative arg for GPU id {args.gpu}"
 	if args.gpu > 0:
 		assert args.gpu < torch.cuda.device_count(), "GPU INDEX OUT OF RANGE."	
-	assert args.workers in range(0,9), "Got out of range arg for nr of workers"
+	# assert args.workers in range(0,9), "Got out of range arg for nr of workers"
 
 	# RETURN
 	return args
 
 
-def train(model,diffusion,loader,optimizer,scheduler,device,normalize,noise=None,n_classes=2):
+def train(model,gpu_aug,diffusion,loader,optimizer,scheduler,device):
 
 	loss_sum = torch.zeros(1,device=device)
 	samp_sum = torch.zeros(1,device=device)
 	model.train()
 
-	for rgb,lbl in loader:
+	for vnir,mask in loader:
 
-		rgb = rgb.to(device,non_blocking=True)
-		lbl = lbl.to(device,non_blocking=True)
-		# rgb = normalize(noise(rgb)) # training augmentation (noise part), on the 0-255 scale
-		rgb = normalize(rgb)
+		vnir = vnir.to(device,non_blocking=True)
+		mask = mask.to(device,non_blocking=True)
+		vnir = gpu_aug(vnir)
 
-		x0  = mask_to_x0(lbl,n_classes)
-		t   = torch.randint(0,diffusion.timesteps,(rgb.shape[0],),device=device,dtype=torch.long)
+		x0  = mask_to_x0(mask,2)
+		t   = torch.randint(0,diffusion.timesteps,(vnir.shape[0],),device=device,dtype=torch.long)
 
 		with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
-			loss = diffusion.p_loss(x0,rgb,t)
+			loss = diffusion.p_loss(x0,vnir,t)
 
 		optimizer.zero_grad()
 		loss.backward()
@@ -246,15 +130,16 @@ def train(model,diffusion,loader,optimizer,scheduler,device,normalize,noise=None
 		optimizer.step()
 
 
-		loss_sum += loss.detach() * rgb.size(0)
-		samp_sum += rgb.size(0)
+		loss_sum += loss.detach() * vnir.size(0)
+		samp_sum += vnir.size(0)
 
 	scheduler.step()
 
-	return (loss_sum/samp_sum).item()
+	return (loss_sum/samp_sum).item() # >>>> CPU-GPU SYNC <<<<
+
 
 @torch.no_grad()
-def validate(model,diffusion,loader,device,normalize,n_classes=2):
+def validate(model,diffusion,loader,device,normalize):
 	'''
 	Noise-prediction (MSE) loss over the full validation set.
 	'''
@@ -262,18 +147,18 @@ def validate(model,diffusion,loader,device,normalize,n_classes=2):
 	mse_loss_sum = torch.zeros(1,device=device)
 	samp_sum     = torch.zeros(1,device=device)
 
-	for rgb,lbl in loader:
+	for vnir,lbl in loader:
 
-		rgb = normalize(rgb.to(device,non_blocking=True))
+		vnir = normalize(vnir.to(device,non_blocking=True))
 		lbl = lbl.to(device,non_blocking=True)
 
 		x0 = mask_to_x0(lbl,n_classes)
-		t  = torch.randint(0,diffusion.timesteps,(rgb.shape[0],),device=device,dtype=torch.long)
+		t  = torch.randint(0,diffusion.timesteps,(vnir.shape[0],),device=device,dtype=torch.long)
 
 		with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
-			mse_loss = diffusion.p_loss(x0,rgb,t)
-		mse_loss_sum += mse_loss.detach() * rgb.size(0)
-		samp_sum     += rgb.size(0)
+			mse_loss = diffusion.p_loss(x0,vnir,t)
+		mse_loss_sum += mse_loss.detach() * vnir.size(0)
+		samp_sum     += vnir.size(0)
 
 	return (mse_loss_sum/samp_sum).item()
 
@@ -293,17 +178,17 @@ def validate_sampling(model,diffusion,loader,device,normalize,n_classes=2,seed=0
 	with torch.random.fork_rng(devices=[device] if device.type == 'cuda' else []):
 		torch.manual_seed(seed)
 
-		for rgb,lbl in loader:
+		for vnir,lbl in loader:
 
-			rgb = normalize(rgb.to(device,non_blocking=True))
+			vnir = normalize(vnir.to(device,non_blocking=True))
 			lbl = lbl.to(device,non_blocking=True)
 
 			with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
-				# x0_pred = diffusion.p_sample_loop(rgb,mask_channels=mask_channels(n_classes))
-				x0_pred = diffusion.ddim_sample_loop(rgb,mask_channels=mask_channels(n_classes))
+				# x0_pred = diffusion.p_sample_loop(vnir,mask_channels=mask_channels(n_classes))
+				x0_pred = diffusion.ddim_sample_loop(vnir,mask_channels=mask_channels(n_classes))
 			pred_mask = x0_to_mask(x0_pred)
-			ce_loss_sum += calculate_cross_entropy(x0_pred.float(),lbl) * rgb.size(0)
-			samp_sum    += rgb.size(0)
+			ce_loss_sum += calculate_cross_entropy(x0_pred.float(),lbl) * vnir.size(0)
+			samp_sum    += vnir.size(0)
 			update_confusion_matrix(gpu_cmat,lbl,pred_mask,n_classes)
 
 	return (ce_loss_sum/samp_sum).item(), gpu_cmat.cpu()

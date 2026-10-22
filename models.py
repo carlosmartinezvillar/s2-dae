@@ -337,11 +337,11 @@ class ConditionEncoder(nn.Module):
 	'''
 	Encoder for RGB inputs.
 	'''
-	def __init__(self,in_channels=3,channels=32,cnn_layers=2):
+	def __init__(self,channels=32,cnn_layers=2):
 		super().__init__()
 		down_config = {'kernel_size': 3, 'stride': 2,'padding': 1, 'bias': True}
 
-		self.in_layer = nn.Conv2d(in_channels,channels,3,1,1,bias=True)
+		self.in_layer = nn.Conv2d(4,channels,kernel_size=1,stride=1,padding=0,bias=True)
 
 		# [H,W]
 		self.stage_1 = ConvBlock(channels,depth=cnn_layers)
@@ -367,6 +367,83 @@ class ConditionEncoder(nn.Module):
 		c5 = self.stage_5(self.down_4(c4))
 		return c3,c4,c5
 
+
+class Projector(nn.Module):
+	'''
+	Barlow Twins projector. Takes [B,D] inputs.
+	'''
+	def __init__(self,in_dim,out_dim=4096):
+		super().__init__()
+		self.layers = nn.Sequential(
+			nn.Linear(in_dim, out_dim),
+			nn.BatchNorm1d(out_dim),
+			nn.ReLU(),
+			nn.Linear(out_dim, out_dim) # Final projection dimension
+		)
+	def forward(self,x):
+		return self.layers(x)
+
+
+class BarlowTwinsLoss(nn.Module):
+	'''
+	L = sum_i (1 - C_ii)^2 + lambda * sum_i sum_{j!=i} C_ij^2
+	C is the cross-correlation matrix between the batch-standardized embeddings
+	of the two views. Computed in float32 regardless of autocast.
+	'''
+	def __init__(self,proj_dim,lambd=5e-3):
+		super().__init__()
+		self.lambd = lambd
+		self.bn    = nn.BatchNorm1d(proj_dim,affine=False,track_running_stats=False)
+
+	def forward(self,z1,z2):
+
+		# DO IN FLOAT 32
+		with torch.autocast(device_type='cuda' if z1.is_cuda else 'cpu',enabled=False):
+
+			# NORMALIZE ON BATCH MEAN AND STD DEV.
+			z1 = self.bn(z1.float())
+			z2 = self.bn(z2.float())
+
+			# CALCULATE CORRELATION MATRIX
+			c  = z1.T @ z2 / z1.shape[0] # [D,D]
+
+			diag     = torch.diagonal(c)
+			on_diag  = (diag - 1).pow(2).sum()
+			off_diag = c.pow(2).sum() - diag.pow(2).sum()
+			loss     = on_diag + self.lambd * off_diag
+
+		return loss, on_diag.detach(), off_diag.detach()
+
+
+class BarlowTwins(nn.Module):
+		def __init__(self,init_chan=32,cnn_layers=2):
+		super().__init__()
+
+		# META
+		self.model_name = "S2BT"
+		self.model_id = model_id
+
+		# ENCODER
+		self.encoder = ConditionEncoder(channels=init_chan,cnn_layers=cnn_layers)
+
+		# PROJECTOR
+		self.rep_dim = init_chan*32 #5 stages of doubling C
+		self.projector = Projector(self.rep_dim,proj_dim)
+
+	def forward(self,x1,x2):
+		rep1_b3,rep1_b4,rep1_b5 = self.encoder(x1)
+
+		if x2 is None:
+			return rep1_b3,rep1_b4,rep1_b5
+
+		_,_,rep2_b5 = self.encoder(x2)
+
+		# Global Average Pooling: [B,C,H,W] -> [B,C]
+		emb1 = self.projector(rep1_b5.mean(dim=(2,3)))
+		emb2 = self.projector(rep2_b5.mean(dim=(2,3)))
+
+		return emb1,emb2
+		
 
 ################################################################################
 # Time Embeddings

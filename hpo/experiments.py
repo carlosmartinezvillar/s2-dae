@@ -51,23 +51,79 @@ def search_lr_and_decay():
 	write_hp_file("hpo_1",rows)
 
 
-################################################################################
-# HELPER/OTHER FUNCTIONS
-################################################################################
-def write_hp_file(name,rows):
-	# WRITE JSON FILE -- NEXT TO THIS SCRIPT, ONE JSON OBJECT PER LINE
-	out_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),f"{name}.json")
-	with open(out_file_path,'w') as fp:
-		for line in rows[0:-1]:
-			json.dump(line,fp)
-			fp.write('\n')
-		json.dump(rows[-1],fp)
-	print(f"Parameter file written to {out_file_path} ({len(rows)} rows)")
+def sample(spec):
+    '''
+    ('log',lo,hi)   -> log-uniform in [lo,hi]
+    ('choice',[..]) -> uniform over the list
+    '''
+    if spec[0] == 'log':
+        _, lo, hi = spec
+        return float(np.exp(np.random.uniform(np.log(lo), np.log(hi))))
+    return spec[1][np.random.randint(len(spec[1]))]
 
 
 def set_seed(seed: int):
 	random.seed(seed)
 	np.random.seed(seed)
+
+
+def set_experiments_unguided_diff(n=30,epochs=500,seed=476,path='./hpo/unguided.json')
+	set_seed(seed)
+	return
+
+
+def set_experiments_bt(n=30, epochs=100, seed=476, path='./hpo/bt_encoder.json'):
+    '''
+    n random optimizer/loss samples for each architecture (proj_dim x init_chan), fixed batch.
+    lrate = base_lrate * sqrt(batch/128), so base_lrate stays comparable if batch is changed later.
+    '''
+    set_seed(seed)
+
+    space = {
+        'base_lrate': ('log', 1e-4, 2e-3),       # lr at batch 256 -- multply by two
+        'decay':      ('log', 1e-4, 5e-2),
+        'lambda_d':   ('log', 1.0, 40.0),        # bt_lambda * proj_dim (off-diag terms grow ~D^2)
+    }
+
+
+    # FIXED
+    batch = 128
+    cnn_layers = 2
+    encoder_type = 'cnn'
+
+
+    # ARCHITECTURES (representation dim = 32*init_chan)
+    grid = []
+    for proj_dim in [1024, 2048, 4096]:
+        for init_chan in [32, 48]:
+            grid.append((proj_dim, init_chan))
+
+    i = 0
+    with open(path, 'w') as fp:
+        for proj_dim, init_chan in grid:
+            for _ in range(n):
+
+                exp = {k: sample(v) for k, v in space.items()}
+                exp['proj_dim']   = proj_dim
+                exp['init_chan']  = init_chan
+                exp['cnn_layers'] = cnn_layers
+                exp['batch']      = batch  # images per batch
+                exp['lrate']      = exp['base_lrate'] * (batch / 128) ** 0.5 #lrate adjust rule
+                exp['encoder']    = encoder_type
+
+                # ROUND (3 SIGNIFICANT FIGURES)
+                for k in ('base_lrate', 'lrate', 'decay', 'lambda_d'):
+                    exp[k] = float(f"{exp[k]:.3g}")
+                exp['bt_lambda'] = float(f"{exp['lambda_d'] / proj_dim:.3g}")
+
+                exp.update({'id': i, 'seed': seed, 'epochs': epochs, 'bands': 10})
+                fp.write(json.dumps(exp) + '\n')
+                i += 1
+
+
+def set_experiments_train(n=30,epochs=500,seed=476,path='./hpo/unguided.json')
+	set_seed(seed)
+	return
 
 
 ################################################################################

@@ -8,6 +8,7 @@ import glob
 import os
 import tifffile as tiff
 import numpy as np
+import time
 
 
 MEAN = torch.tensor([123.305154,132.731427,131.599954,115.507302]).view(-1,1,1)
@@ -43,8 +44,13 @@ def build_cached_dataset(chip_dir,cache_dir,split):
 
 
 def load_cached_split(cache_dir,split):
+	print(f"Loading cached .npy files in {cache_dir}...")
+	t0_disk_to_ram = time.perf_counter()
 	vnir = np.load(f"{cache_dir}/{split}_bands.npy")
 	mask = np.load(f"{cache_dir}/{split}_masks.npy")
+	t1_disk_to_ram = time.perf_counter()
+	print("Loaded to RAM! -- ",end='')
+	print(f"{t1_disk_to_ram-t0_disk_to_ram:.2f} secs.")
 	return vnir,mask
 
 
@@ -68,15 +74,130 @@ class TrainTransform:
 			])
 		])
 
-		# self.intensity = v2.Compose([
-			# v2.GaussianNoise(mean=0,sigma=0.02*255,clip=False)
-		# ])
-
 
 	def __call__(self,image,label):
 		image, label = self.geometric(image,label)
-		# image        = self.intensity(image)
 		return image, label
+
+
+# class GPULabeledTransform(torch.nn.Module):
+
+
+class GPUImageViewTransform(torch.nn.Module):
+
+	'''
+	On-GPU transform. Takes a whole uint8 batch
+	[B,10,256,256] already on the device and returns the augmented, normalized
+	float32 batch [B,10,crop,crop].
+
+	Defaults reproduce ImageViewTransform(crop_size=192,blur=0.1): same crop,
+	same blur kernel/sigma, same gain, and offset/noise off (post_norm is
+	commented out in the CPU class). Pass offset/noise explicitly to enable them.
+
+	Use:
+		aug = dataloader.GPUImageTransform().to(device)
+		for x in loader:                      # x is uint8 [B,10,256,256]
+			x = x.to(device,non_blocking=True)
+			X1,X2 = aug(x)
+	'''
+	def __init__(self,crop=192,blur=0.1,ksize=7,sigma=(0.5,1.0),gain=0.10):
+		super().__init__()
+		self.crop    = crop
+		self.blur    = blur
+		self.ksize   = ksize
+		self.sigma   = sigma
+		self.gain    = gain
+
+		self.register_buffer('mean',MEAN.clone())
+		self.register_buffer('stdd',STDD.clone())
+
+	def geometric(self,x):
+		# PER-SAMPLE CROP ORIGIN + THE 8 DIHEDRAL ELEMENTS (FLIPS x TRANSPOSE),
+		# AS ONE GATHER. KEPT IN THE INPUT DTYPE SO uint8 IS CAST AFTER CROPPING.
+		B,C,H,W = x.shape
+		S,dev = self.crop,x.device
+		top = torch.randint(0,H-S+1,(B,1),device=dev)
+		left = torch.randint(0,W-S+1,(B,1),device=dev)
+		i = torch.arange(S,device=dev).expand(B,S)
+
+		flip_v,flip_h,transp = (torch.rand(3,B,1,device=dev) < 0.5)
+		rows = top  + torch.where(flip_v,S-1-i,i)
+		cols = left + torch.where(flip_h,S-1-i,i)
+		R  = rows[:,:,None].expand(B,S,S)
+		cc = cols[:,None,:].expand(B,S,S)
+		t  = transp[:,:,None]
+		R,cc = torch.where(t,R.transpose(1,2),R),torch.where(t,cc.transpose(1,2),cc)
+		b  = torch.arange(B,device=dev)[:,None,None]
+		return x[b,:,R,cc].permute(0,3,1,2)
+
+
+	def gaussian_blur(self,x):
+		# PER-SAMPLE SIGMA, ONLY ON THE SAMPLES PICKED
+		B,C,H,W = x.shape
+		pick = torch.rand(B,device=x.device) < self.blur
+		n = int(pick.sum())
+		if n == 0:
+			return x
+		sig = torch.empty(n,1,device=x.device).uniform_(*self.sigma)
+		k   = torch.arange(self.ksize,device=x.device) - (self.ksize-1)/2
+		w   = torch.exp(-0.5*(k/sig)**2); w = w/w.sum(1,keepdim=True)
+		w   = w.repeat_interleave(C,0)
+		p   = self.ksize//2
+		y   = F.pad(x[pick].reshape(1,n*C,H,W),(p,p,p,p),mode='reflect')
+		y   = F.conv2d(y,w[:,None,None,:],groups=n*C)
+		y   = F.conv2d(y,w[:,None,:,None],groups=n*C)
+		x   = x.clone(); x[pick] = y.reshape(n,C,H,W)
+		return x
+
+
+	@torch.no_grad()
+	def forward(self,x):
+		B,dev = x.shape[0],x.device
+
+		# CROP/FLIP/ROTATE, THEN CAST: ONLY THE cropxcrop WINDOW BECOMES float32
+		x = self.geometric(x).float()
+
+		# BLUR AND GAIN ARE BOTH LINEAR, SO APPLYING THEM TO THE RAW 0-255
+		if self.blur > 0:
+			x = self.gaussian_blur(x)
+		if self.gain > 0:
+			x = x * torch.empty(B,1,1,1,device=dev).uniform_(1-self.gain,1+self.gain)
+
+		# NORMALIZE
+		x = (x-self.mean)/self.stdd
+
+		return x
+
+
+class GPUPairedTransform(torch.nn.Module):
+	'''
+	GPU counterpart of ImageTransform: two views with asymmetric blur.
+	Takes the uint8 batch, returns (X1,X2) float32.
+	'''
+	def __init__(self,crop=192):
+		super().__init__()
+		self.view_1 = GPUImageViewTransform(crop=crop,blur=0.1)
+		self.view_2 = GPUImageViewTransform(crop=crop,blur=1.0) #asymmetric blur
+
+	@torch.no_grad()
+	def forward(self,x):
+		return self.view_1(x),self.view_2(x)
+
+
+class GPUValidationTransform(torch.nn.Module):
+	'''
+	GPU counterpart of the band normalization in RAMLabeledDataset: no
+	augmentation, only cast + normalize. Takes the uint8 batch [B,10,H,W]
+	already on the device, returns float32.
+	'''
+	def __init__(self):
+		super().__init__()
+		self.register_buffer('mean',MEAN.clone())
+		self.register_buffer('stdd',STDD.clone())
+
+	@torch.no_grad()
+	def forward(self,x):
+		return (x.float()-self.mean)/self.stdd
 
 
 class SentinelDataset(torch.utils.data.Dataset):
@@ -192,13 +313,10 @@ class SentinelFastDataset(torch.utils.data.Dataset):
 
 	# splits = ("training","validation","testing")
 
-	def __init__(self,bands_ndarray,masks_ndarray,transform=None):
+	def __init__(self,bands_ndarray,masks_ndarray):
 		self.bands = torch.from_numpy(bands_ndarray)
 		self.masks = torch.from_numpy(masks_ndarray)
 		self.n    = self.bands.shape[0]
-		self.transform = transform
-		self.mean = MEAN
-		self.stdd = STDD
 
 	def __len__(self):
 		return self.n
@@ -206,39 +324,36 @@ class SentinelFastDataset(torch.utils.data.Dataset):
 	def __getitem__(self,idx):
 		vnir = self.bands[idx]
 		mask = self.masks[idx]
+		mask = torch.squeeze(mask,0).div(255,rounding_mode='floor').to(torch.int64)
 
-		vnir = tv_tensors.Image(vnir.to(torch.float32))
-		mask = tv_tensors.Mask(torch.squeeze(mask,0).div(255,rounding_mode='floor').to(torch.int64))
-
-		if self.transform():
-			vnir,mask = self.transform(vnir,mask)
-
-		vnir = (vnir-self.mean) / self.stdd
+		# vnir = tv_tensors.Image(vnir.to(torch.float32))
+		# mask = tv_tensors.Mask(torch.squeeze(mask,0).div(255,rounding_mode='floor').to(torch.int64))
+		# if self.transform():
+		# 	vnir,mask = self.transform(vnir,mask)
+		# vnir = (vnir-self.mean) / self.stdd
 
 		return vnir,mask
 
 
 class TwinFastDataset(torch.utils.data.Dataset):
-	def __init__(self,bands_ndarray,transform):
+	def __init__(self,bands_ndarray):
 		self.bands = torch.from_numpy(bands_ndarray)
 		self.n     = self.bands.shape[0]
-		self.mean = MEAN
-		self.stdd = STDD
-		self.transform = transform
 
 	def __len__(self):
 		return self.n
 
 	def __getitem__(self,idx):
 		vnir = self.bands[idx]
-		vnir = tv_tensors.Image(vnir.to(torch.float32))
-		vnir = self.transform(vnir)
-		vnir = (vnir-self.mean)/self.stdd
+		# vnir = tv_tensors.Image(vnir.to(torch.float32))
+		# vnir = self.transform(vnir)
+		# vnir = (vnir-self.mean)/self.stdd
 		return vnir
 
 
 if __name__ == '__main__':
 	args.data_dir = None
 	args.cache_dir = None
-	split = None
-	build_cached_dataset(args.data_dir,args.cache_dir,split)
+	splits = ("training","validation","testing")
+	for s in splits:
+		build_cached_dataset(args.data_dir,args.cache_dir,s)
