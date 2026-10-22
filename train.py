@@ -397,7 +397,7 @@ def train_and_validate(args):
 		schedulers=[warmup_sched,cosine_sched],
 		milestones=[warmup_steps]
 	)
-
+ 
 	# FORWARD + REVERSE DIFFUSION
 	diffusion = GaussianDiffusion(model,timesteps=1000,ddim_steps=100,device=device)
 
