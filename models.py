@@ -180,7 +180,7 @@ class ViTLayer(nn.Module):
 
 class ConditionedViTLayer(nn.Module):
 	'''
-	Complete ViT layer with added cross attention for RGB context
+	Complete ViT layer with added cross attention for VNIR context
 	'''
 	def __init__(self,E,num_heads,time_dim,context_dim,mlp_ratio=4):
 		super().__init__()
@@ -256,6 +256,14 @@ class ConditionedViTBlock(nn.Module):
 ################################################################################
 # DENOISING ENCODERS
 ################################################################################
+class CNNEncoder(nn.Module):
+	def __init__(self):
+
+		down_params = {'kernel_size': 3, 'stride': 2, 'padding': 1, 'bias': True}
+
+	def forward(self,x):
+		return x
+
 class ViTEncoder(nn.Module):
 	'''
 	Hybrid CNN/ViT without positional encoding. 2xCNN + 3xViT layers.
@@ -291,6 +299,14 @@ class ViTEncoder(nn.Module):
 ################################################################################
 # DENOISING DECODERS
 ################################################################################
+class CNNDecoder(nn.Module):
+	def __init__(self):
+
+		up_params = {'kernel_size': 4, 'stride': 2, 'padding': 1, 'bias': True}
+
+	def forward(self,x):
+		return x	
+
 class ViTDecoder(nn.Module):
 	'''
 	3-stage ViT & 2-stage CNN. Mirrors ViTEncoder().
@@ -489,32 +505,32 @@ class TimeEmbedding(nn.Module):
 ################################################################################
 class S2SegDiff(nn.Module):
 
-	def __init__(self,model_id,mask_channels,in_channels,cnn_layers=3,vit_layers=1,channels=32,mlp_ratio=5,time_dim=256):
+	def __init__(self,model_id,cnn_layers=2,vit_layers=1,init_chan_cond=32,init_chan_diff=16,time_dim=256):
 		super().__init__()
 
 		self.model_name = "S2SegDiff"
 		self.model_id   = model_id
 
 		# time embeddings
-		self.time_embedder = TimeEmbedding(channels,time_dim=time_dim)
+		self.time_embedder = TimeEmbedding(init_chan_diff,time_dim=time_dim)
 
 		# context embeddings
-		context_dims = (channels*4,channels*8,channels*16)
-		self.cond_encoder  = ConditionEncoder(in_channels,channels,cnn_layers=2)
+		context_dims = (init_chan_cond*2,init_chan_cond*4,init_chan_cond*8,init_chan_cond*16)
+		self.cond_encoder  = ConditionEncoder(channels=init_chan_cond,cnn_layers=cnn_layers)
 
-		# input projection layer to 'channels' argument
-		self.in_layer = nn.Conv2d(mask_channels, channels, 3, 1, 1, bias=True)
+		# Denoiser input projection layer to 'channels' argument
+		self.in_layer = nn.Conv2d(2,init_chan_diff,kernel_size=1,stride=1,padding=0,bias=True)
 
-		# encoder / decoder
-		self.encoder = ViTEncoder(cnn_layers, vit_layers, channels, mlp_ratio,time_dim,context_dims)
-		self.decoder = ViTDecoder(cnn_layers, vit_layers, channels, mlp_ratio,time_dim,context_dims)
+		# Denoising encoder & decoder
+		self.encoder = ViTEncoder(cnn_layers,vit_layers,channels,mlp_ratio,time_dim,context_dims)
+		self.decoder = ViTDecoder(cnn_layers,vit_layers,channels,mlp_ratio,time_dim,context_dims)
 
 		# final 1x1 classifier
-		self.out_layer = nn.Conv2d(channels, mask_channels, kernel_size=1, bias=True)
+		self.out_layer = nn.Conv2d(channels,mask_channels,kernel_size=1,bias=True)
 
-	def forward(self,x_t,t,rgb_image):
+	def forward(self,x_t,t,vnir_image):
 		t_emb   = self.time_embedder(t)
-		context = self.cond_encoder(rgb_image)
+		context = self.cond_encoder(vnir_image)
 
 		x             = self.in_layer(x_t)
 		skips,enc_out = self.encoder(x,t_emb,context)
