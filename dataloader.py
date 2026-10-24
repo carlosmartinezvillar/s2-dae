@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import torchvision
 from torchvision import tv_tensors
 from PIL import Image
@@ -9,7 +10,6 @@ import os
 import tifffile as tiff
 import numpy as np
 import time
-
 
 MEAN = torch.tensor([123.305154,132.731427,131.599954,115.507302]).view(-1,1,1)
 STDD = torch.tensor([53.223368,51.529520,53.707588,55.610260]).view(-1,1,1)
@@ -55,32 +55,51 @@ def load_cached_split(cache_dir,split):
 
 
 ################################################################################
-# CLASSES
+# AUGMENTATIONS
 ################################################################################
-class TrainTransform:
+class GPULabeledTransform(torch.nn.Module):
 	'''
-	Class for the augmentation performed during training. Image and label use
-	same geometric rotation/flip. Color jitter and blur applied only to bands.
+	On-GPU training transform for labeled batches. Takes the uint8 image
+	[B,C,H,W] and uint8 mask [B,1,H,W] (0/255) already on the
+	device (square chips, H == W). Applies the same random flip/transpose to
+	image and mask, then gain to the image only. Returns the normalized
+	float32 image and the int64 class mask [B,H,W].
+
+	Use:
+		gpu_tf = dataloader.GPULabeledTransform().to(device)
+		for x,y in loader:                    # both uint8
+			x,y = gpu_tf(x.to(device,non_blocking=True),y.to(device,non_blocking=True))
 	'''
-	def __init__(self):
-		self.geometric = v2.Compose([
-			v2.RandomHorizontalFlip(p=0.5),
-			v2.RandomVerticalFlip(p=0.5),
-			v2.RandomChoice([
-				v2.RandomRotation([0,0]),
-				v2.RandomRotation([90,90]),
-				v2.RandomRotation([180,180]),
-				v2.RandomRotation([270,270])
-			])
-		])
+	def __init__(self,gain=0.10):
+		super().__init__()
+		self.gain = gain
+		self.register_buffer('mean',MEAN.clone())
+		self.register_buffer('stdd',STDD.clone())
 
+	def dihedral(self,x):
+		# PER-SAMPLE FLIPS x TRANSPOSE = THE 8 DIHEDRAL ELEMENTS
+		flip_v,flip_h,transp = (torch.rand(3,x.shape[0],1,1,1,device=x.device) < 0.5)
+		x = torch.where(flip_v,x.flip(2),x)
+		x = torch.where(flip_h,x.flip(3),x)
+		return torch.where(transp,x.transpose(2,3),x)
 
-	def __call__(self,image,label):
-		image, label = self.geometric(image,label)
-		return image, label
+	@torch.no_grad()
+	def forward(self,x,y):
+		# MASK RIDES ALONG AS AN EXTRA CHANNEL SO BOTH GET THE SAME GEOMETRY
+		y   = y.view(x.shape[0],1,*x.shape[-2:]) # [B,H,W] OR [B,1,H,W] -> [B,1,H,W]
+		xy  = self.dihedral(torch.cat([x,y],dim=1))
+		x,y = xy[:,:-1].float(),xy[:,-1] # [:,-1] DROPS THE CHANNEL DIM -> [B,H,W]
 
+		# GAIN SCALING ON UNIFORM DIST [1-gain,1+gain]
+		if self.gain > 0:
+			g = self.gain
+			x = x * torch.empty(x.shape[0],1,1,1,device=x.device).uniform_(1-g,1+g)
 
-# class GPULabeledTransform(torch.nn.Module):
+		# NORMALIZE IMAGE, 0/255 MASK -> 0/1 CLASS INDICES
+		x = (x-self.mean)/self.stdd
+		y = y.div(255,rounding_mode='floor').long()
+
+		return x,y
 
 
 class GPUImageViewTransform(torch.nn.Module):
@@ -186,9 +205,9 @@ class GPUPairedTransform(torch.nn.Module):
 
 class GPUValidationTransform(torch.nn.Module):
 	'''
-	GPU counterpart of the band normalization in RAMLabeledDataset: no
-	augmentation, only cast + normalize. Takes the uint8 batch [B,10,H,W]
-	already on the device, returns float32.
+	GPU band normalization. No augmentation, only cast + normalize.
+	Takes the uint8 batch [B,4,H,W] and uint8 mask [B,1,H,W] (0/255).
+	Returns the float32 image and the int64 class mask [B,H,W].
 	'''
 	def __init__(self):
 		super().__init__()
@@ -196,10 +215,14 @@ class GPUValidationTransform(torch.nn.Module):
 		self.register_buffer('stdd',STDD.clone())
 
 	@torch.no_grad()
-	def forward(self,x):
-		return (x.float()-self.mean)/self.stdd
+	def forward(self,x,y):
+		x = (x.float()-self.mean)/self.stdd
+		y = y.squeeze(1).div(255,rounding_mode='floor').long() # 0/255 MASK -> 0/1 CLASS INDICES
+		return x,y
 
-
+################################################################################
+# DISK I/O DATASET
+################################################################################
 class SentinelDataset(torch.utils.data.Dataset):
 	def __init__(self,chip_dir,n_bands=3,n_labels=2,transform=None,mask_dir=None):
 
@@ -308,7 +331,9 @@ class SentinelDataset(torch.utils.data.Dataset):
 		else:
 			return image,label
 
-
+################################################################################
+# FAST DATASETS (RAM and uint8 only)
+################################################################################
 class SentinelFastDataset(torch.utils.data.Dataset):
 
 	# splits = ("training","validation","testing")
@@ -324,7 +349,7 @@ class SentinelFastDataset(torch.utils.data.Dataset):
 	def __getitem__(self,idx):
 		vnir = self.bands[idx]
 		mask = self.masks[idx]
-		mask = torch.squeeze(mask,0).div(255,rounding_mode='floor').to(torch.int64)
+		# mask = torch.squeeze(mask,0).div(255,rounding_mode='floor').to(torch.int64)
 
 		# vnir = tv_tensors.Image(vnir.to(torch.float32))
 		# mask = tv_tensors.Mask(torch.squeeze(mask,0).div(255,rounding_mode='floor').to(torch.int64))

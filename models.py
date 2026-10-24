@@ -6,7 +6,7 @@ from torch.utils.flop_counter import FlopCounterMode
 
 
 ################################################################################
-# CNN Blocks
+# CNN/ViT Blocks
 ################################################################################
 class ConvBlock(nn.Module):
 	'''
@@ -30,35 +30,6 @@ class ConvBlock(nn.Module):
 		return x + out
 
 
-class TimeConditionedConvBlock(nn.Module):
-	'''
-	ConvBlock conditioned on embeddings of timestep.
-	'''
-	def __init__(self,channels,time_dim,depth=2):
-		super().__init__()
-		self.convs = nn.ModuleList()
-		self.norms = nn.ModuleList()
-		self.activ = nn.ModuleList()
-		self.time_proj = nn.ModuleList()
-		for _ in range(depth):
-			self.convs.append(nn.Conv2d(channels,channels,kernel_size=3,stride=1,padding=1,bias=True))
-			self.norms.append(nn.GroupNorm(1,channels))
-			self.activ.append(nn.GELU())
-			self.time_proj.append(nn.Linear(time_dim,channels*2))
-
-	def forward(self,x,t_emb):
-		out = x
-		for conv,norm,proj,act in zip(self.convs,self.norms,self.time_proj,self.activ):
-			out = conv(out)
-			out = norm(out)
-			scale,shift = proj(t_emb).chunk(2,dim=-1)
-			out = out * (1 + scale[:,:,None,None]) + shift[:,:,None,None]
-			out = act(out)
-		return x + out
-
-################################################################################
-# ViT Blocks
-################################################################################
 class MultiHeadSelfAttention(nn.Module):
 	'''
 	Multi-head Self-Attention Operation
@@ -156,6 +127,72 @@ class CrossAttention(nn.Module):
 
 class ViTLayer(nn.Module):
 	'''
+	A complete ViT layer (i.e. MHSA + MLP)
+	'''
+	def __init__(self,E,num_heads,mlp_ratio=4):
+		super().__init__()
+		self.norm1 = nn.LayerNorm(E)
+		self.attn  = MultiHeadSelfAttention(E,num_heads)
+		self.norm2 = nn.LayerNorm(E)
+		self.mlp   = MLP(E, mlp_ratio)
+
+	def forward(self, tokens):
+		tokens = tokens + self.attn(self.norm1(tokens))
+		tokens = tokens + self.mlp(self.norm2(tokens))
+		return tokens
+
+
+class ViTBlock(nn.Module):
+	'''
+	Wrapper for ViT layers for image-token-image conversion.
+	Takes inputs [B,C,H,W]. Returns [B,C,H,W]
+	'''
+	def __init__(self,E,num_heads,mlp_ratio=4,depth=1):
+		super().__init__()
+		self.block = nn.ModuleList([ViTLayer(E,num_heads,mlp_ratio) for _ in range(depth)])
+		# self.block = ViTLayer(E,num_heads,mlp_ratio) #single layer for now
+
+	def forward(self,x):
+		B,C,H,W = x.shape
+		tokens = x.permute(0,2,3,1).reshape(B,H*W,C)
+		# tokens = self.block(tokens)
+		for layer in self.block:
+			tokens = layer(tokens)
+		return tokens.reshape(B,H,W,C).permute(0,3,1,2)
+
+
+################################################################################
+# TIME ADJUSTED LAYERS
+################################################################################
+class TimeConvBlock(nn.Module):
+	'''
+	ConvBlock conditioned on embeddings of timestep.
+	'''
+	def __init__(self,channels,time_dim,depth=2):
+		super().__init__()
+		self.convs = nn.ModuleList()
+		self.norms = nn.ModuleList()
+		self.activ = nn.ModuleList()
+		self.time_proj = nn.ModuleList()
+		for _ in range(depth):
+			self.convs.append(nn.Conv2d(channels,channels,kernel_size=3,stride=1,padding=1,bias=True))
+			self.norms.append(nn.GroupNorm(1,channels))
+			self.activ.append(nn.GELU())
+			self.time_proj.append(nn.Linear(time_dim,channels*2))
+
+	def forward(self,x,t_emb):
+		out = x
+		for conv,norm,proj,act in zip(self.convs,self.norms,self.time_proj,self.activ):
+			out = conv(out)
+			out = norm(out)
+			scale,shift = proj(t_emb).chunk(2,dim=-1)
+			out = out * (1 + scale[:,:,None,None]) + shift[:,:,None,None]
+			out = act(out)
+		return x + out
+
+
+class TimeViTLayer(nn.Module):
+	'''
 	A complete ViT layer (i.e. MHSA + MLP) conditioned on time embeddings.
 	'''
 	def __init__(self,E,num_heads,time_dim,mlp_ratio=4):
@@ -175,10 +212,32 @@ class ViTLayer(nn.Module):
 		scale,shift = self.time_proj2(t_emb).chunk(2,dim=-1)
 		h = self.norm2(tokens) * (1 + scale[:,None,:]) + shift[:,None,:]
 		tokens = tokens + self.mlp(h)
-		return tokens
+		return tokens	
 
 
-class ConditionedViTLayer(nn.Module):
+class TimeViTBlock(nn.Module):
+	'''
+	Wrapper for ViT layers for image-token-image conversion.
+	'Block' means a grouping intended as equivalent to 'convolutional' block in CNNs.
+	Takes an 'image-shaped' feature map [B,C,H,W]. Returns tensor of same shape.
+	'''
+	def __init__(self,E,num_heads,time_dim,mlp_ratio=4,depth=2):
+		super().__init__()
+		self.block = nn.ModuleList([TimeViTLayer(E,num_heads,time_dim,mlp_ratio) for _ in range(depth)])
+
+	def forward(self,x,t_emb):
+		B,C,H,W = x.shape
+		tokens = x.permute(0,2,3,1).reshape(B,H*W,C)
+		# tokens = self.block(tokens)
+		for layer in self.block:
+			tokens = layer(tokens,t_emb)
+		return tokens.reshape(B,H,W,C).permute(0,3,1,2)
+
+
+################################################################################
+# BLOCKS COMBINING CONTEXT
+################################################################################
+class ContextViTLayer(nn.Module):
 	'''
 	Complete ViT layer with added cross attention for VNIR context
 	'''
@@ -205,29 +264,10 @@ class ConditionedViTLayer(nn.Module):
 		scale,shift = self.time_proj2(t_emb).chunk(2,dim=-1)
 		h = self.norm2(tokens) * (1 + scale[:,None,:]) + shift[:,None,:]
 		tokens = tokens + self.mlp(h)
-		return tokens	
+		return tokens
 
 
-class ViTBlock(nn.Module):
-	'''
-	Wrapper for ViT layers for image-token-image conversion.
-	'Block' means a grouping intended as equivalent to 'convolutional' block in CNNs.
-	Takes an 'image-shaped' feature map [B,C,H,W]. Returns tensor of same shape.
-	'''
-	def __init__(self,E,num_heads,time_dim,mlp_ratio=4,depth=2):
-		super().__init__()
-		self.block = nn.ModuleList([ViTLayer(E,num_heads,time_dim,mlp_ratio) for _ in range(depth)])
-
-	def forward(self,x,t_emb):
-		B,C,H,W = x.shape
-		tokens = x.permute(0,2,3,1).reshape(B,H*W,C)
-		# tokens = self.block(tokens)
-		for layer in self.block:
-			tokens = layer(tokens,t_emb)
-		return tokens.reshape(B,H,W,C).permute(0,3,1,2)
-
-
-class ConditionedViTBlock(nn.Module):
+class ContextViTBlock(nn.Module):
 	'''
 	Wrapper for ViT layers for image-token-image conversion.
 	'Block' means a grouping intended as equivalent to 'convolutional' block in CNNs.
@@ -237,7 +277,7 @@ class ConditionedViTBlock(nn.Module):
 	'''
 	def __init__(self,E,num_heads,time_dim,context_dim,mlp_ratio=4,depth=1):
 		super().__init__()
-		self.block = nn.ModuleList([ConditionedViTLayer(E,num_heads,time_dim,context_dim,mlp_ratio) for _ in range(depth)])
+		self.block = nn.ModuleList([ContextViTLayer(E,num_heads,time_dim,context_dim,mlp_ratio) for _ in range(depth)])
 		# self.s_attn = 
 		# self.c_attn = ConditionedViTLayer(E,num_heads,time_dim,context_dim,mlp_ratio)
 
@@ -253,18 +293,33 @@ class ConditionedViTBlock(nn.Module):
 		return tokens.reshape(B,H,W,C).permute(0,3,1,2)
 
 
+class ContextCNNBlock(nn.Module): # --TODO
+	'''
+	Wrapper for ViT layers for image-token-image conversion.
+	'Block' means a grouping intended as equivalent to 'convolutional' block in CNNs.
+	Takes an 'image-shaped' feature map [B,C,H,W]. Returns tensor of same shape.
+	Cross-attends to context, an 'image-shaped' feature map [B,C_context,H,W] with the same
+	H,W as x.
+	'''
+	def __init__(self):
+		super().__init__()
+
+	def forward(self,x,t_emb,context):
+		return x + t_emb + context 
+
+
 ################################################################################
 # DENOISING ENCODERS
 ################################################################################
-class CNNEncoder(nn.Module):
+class DenoisingCNNEncoder(nn.Module): # --- TODO
 	def __init__(self):
-
+		super().__init__()
 		down_params = {'kernel_size': 3, 'stride': 2, 'padding': 1, 'bias': True}
 
 	def forward(self,x):
 		return x
 
-class ViTEncoder(nn.Module):
+class DenoisingViTEncoder(nn.Module):
 	'''
 	Hybrid CNN/ViT without positional encoding. 2xCNN + 3xViT layers.
 	All blocks timestep-conditioned.
@@ -287,7 +342,7 @@ class ViTEncoder(nn.Module):
 		self.encoder_5 = ConditionedViTBlock(channels*16,num_heads=8,time_dim=time_dim,context_dim=c5_dim,mlp_ratio=mlp_ratio,depth=vit_layers)	
 
 	def forward(self,x,t_emb,context):
-		c3,c4,c5 = context
+		_,_,c3,c4,c5 = context
 		enc_1 = self.encoder_1(x,t_emb)
 		enc_2 = self.encoder_2(self.down_1(enc_1),t_emb)
 		enc_3 = self.encoder_3(self.down_2(enc_2),t_emb,c3)
@@ -299,15 +354,15 @@ class ViTEncoder(nn.Module):
 ################################################################################
 # DENOISING DECODERS
 ################################################################################
-class CNNDecoder(nn.Module):
+class DenoisingCNNDecoder(nn.Module): # --- TODO
 	def __init__(self):
-
+		super().__init__()
 		up_params = {'kernel_size': 4, 'stride': 2, 'padding': 1, 'bias': True}
 
 	def forward(self,x):
 		return x	
 
-class ViTDecoder(nn.Module):
+class DenoisingViTDecoder(nn.Module):
 	'''
 	3-stage ViT & 2-stage CNN. Mirrors ViTEncoder().
 	'''
@@ -349,15 +404,15 @@ class ViTDecoder(nn.Module):
 ################################################################################
 # CONDITION/ALIGNMENT ENCODERS
 ###############################################################################
-class ConditionEncoder(nn.Module):
+class ConditionCNNEncoder(nn.Module):
 	'''
 	Encoder for RGB inputs.
 	'''
-	def __init__(self,channels=32,cnn_layers=2):
+	def __init__(self,channels=32,cnn_layers=2,in_channels=4):
 		super().__init__()
 		down_config = {'kernel_size': 3, 'stride': 2,'padding': 1, 'bias': True}
 
-		self.in_layer = nn.Conv2d(4,channels,kernel_size=1,stride=1,padding=0,bias=True)
+		self.in_layer = nn.Conv2d(in_channels,channels,3,1,1,bias=True)
 
 		# [H,W]
 		self.stage_1 = ConvBlock(channels,depth=cnn_layers)
@@ -376,12 +431,43 @@ class ConditionEncoder(nn.Module):
 
 	def forward(self,x):
 		x = self.in_layer(x)
-		x  = self.stage_1(x)
-		x  = self.stage_2(self.down_1(x))
-		c3 = self.stage_3(self.down_2(x))
+		c1 = self.stage_1(x)
+		c2 = self.stage_2(self.down_1(c1))
+		c3 = self.stage_3(self.down_2(c2))
 		c4 = self.stage_4(self.down_3(c3))
 		c5 = self.stage_5(self.down_4(c4))
-		return c3,c4,c5
+		return [c1,c2,c3,c4],c5
+
+
+class ConditionViTEncoder(nn.Module):
+	'''
+	Encoder for RGB inputs.
+	Hybrid ViT without positional encoding. 2xCNN + 3xViT layers
+	'''
+	def __init__(self,channels=32,cnn_layers=2,mlp_ratio=4,in_channels=4):
+		super().__init__()
+		down_params = {'kernel_size': 3, 'stride': 2, 'padding': 1, 'bias': True}
+
+		self.in_layer = nn.Conv2d(in_channels,channels,3,1,1,bias=True)
+
+		self.encoder_1 = ConvBlock(channels,depth=cnn_layers) #32
+		self.down_1    = nn.Conv2d(channels,channels*2,**down_params)
+		self.encoder_2 = ConvBlock(channels*2,depth=cnn_layers)
+		self.down_2    = nn.Conv2d(channels*2,channels*4,**down_params)
+		self.encoder_3 = ViTBlock(channels*4,num_heads=2,mlp_ratio=mlp_ratio,depth=1)		
+		self.down_3    = nn.Conv2d(channels*4,channels*8,**down_params)
+		self.encoder_4 = ViTBlock(channels*8,num_heads=4,mlp_ratio=mlp_ratio,depth=1)
+		self.down_4    = nn.Conv2d(channels*8,channels*16,**down_params)
+		self.encoder_5 = ViTBlock(channels*16,num_heads=8,mlp_ratio=mlp_ratio,depth=1)	
+
+	def forward(self,x):
+		x = self.in_layer(x)
+		enc_1 = self.encoder_1(x)
+		enc_2 = self.encoder_2(self.down_1(enc_1))
+		enc_3 = self.encoder_3(self.down_2(enc_2))
+		enc_4 = self.encoder_4(self.down_3(enc_3))
+		enc_5 = self.encoder_5(self.down_4(enc_4))
+		return [enc_1,enc_2,enc_3,enc_4], enc_5
 
 
 class Projector(nn.Module):
@@ -432,7 +518,7 @@ class BarlowTwinsLoss(nn.Module):
 
 
 class BarlowTwins(nn.Module):
-		def __init__(self,init_chan=32,cnn_layers=2):
+	def __init__(self,model_id,init_chan=32,cnn_layers=2,proj_dim=8192,encoder='cnn'):
 		super().__init__()
 
 		# META
@@ -440,26 +526,110 @@ class BarlowTwins(nn.Module):
 		self.model_id = model_id
 
 		# ENCODER
-		self.encoder = ConditionEncoder(channels=init_chan,cnn_layers=cnn_layers)
+		assert encoder in ["cnn","vit"]
+		if encoder == 'cnn':
+			self.encoder = ConditionCNNEncoder(channels=init_chan,cnn_layers=cnn_layers)
+		if encoder == 'vit':
+			self.encoder = ConditionViTEncoder(channels=init_chan,cnn_layers=cnn_layers,mlp_ratio=4)
 
 		# PROJECTOR
-		self.rep_dim = init_chan*32 #5 stages of doubling C
+		self.rep_dim = init_chan*16 #5 stages, 4 downsamplings doubling C -> c5 has init_chan*16
 		self.projector = Projector(self.rep_dim,proj_dim)
 
 	def forward(self,x1,x2):
-		rep1_b3,rep1_b4,rep1_b5 = self.encoder(x1)
+		skips1,rep1_b5 = self.encoder(x1) # ([c1,c2,c3,c4],c5)
 
 		if x2 is None:
-			return rep1_b3,rep1_b4,rep1_b5
+			return skips1,rep1_b5
 
-		_,_,rep2_b5 = self.encoder(x2)
+		_,rep2_b5 = self.encoder(x2)
 
 		# Global Average Pooling: [B,C,H,W] -> [B,C]
 		emb1 = self.projector(rep1_b5.mean(dim=(2,3)))
 		emb2 = self.projector(rep2_b5.mean(dim=(2,3)))
 
 		return emb1,emb2
-		
+
+
+################################################################################
+# BASE/STANDARD MODEL
+################################################################################
+class BaseCNNSegDecoder(nn.Module):
+	'''
+	5-stage CNN.
+	'''
+	def __init__(self,channels=32,cnn_layers=2):
+		super().__init__()
+		up_params = {'kernel_size': 4, 'stride': 2,'padding': 1, 'bias': True}
+
+		self.decoder_1 = ConvBlock(channels*16,depth=cnn_layers)
+		self.up_1      = nn.ConvTranspose2d(channels*16,channels*8,**up_params)
+
+		self.ch_mix_2  = nn.Conv2d(channels*16,channels*8,1,bias=True)
+		self.decoder_2 = ConvBlock(channels*8,depth=cnn_layers)
+		self.up_2      = nn.ConvTranspose2d(channels*8,channels*4,**up_params)
+
+		self.ch_mix_3  = nn.Conv2d(channels*8,channels*4,1,bias=True)
+		self.decoder_3 = ConvBlock(channels*4,depth=cnn_layers)
+		self.up_3      = nn.ConvTranspose2d(channels*4,channels*2,**up_params)
+
+		self.ch_mix_4  = nn.Conv2d(channels*4,channels*2,1,bias=True)
+		self.decoder_4 = ConvBlock(channels*2,depth=cnn_layers)
+		self.up_4      = nn.ConvTranspose2d(channels*2,channels,**up_params)
+
+		self.ch_mix_5  = nn.Conv2d(channels*2,channels,1,bias=True)
+		self.decoder_5 = ConvBlock(channels,depth=cnn_layers)
+
+		self.out_layer = nn.Conv2d(channels,2,kernel_size=1,padding=0)
+
+	def forward(self,x,skips):
+		enc_1,enc_2,enc_3,enc_4 = skips
+		dec_1 = self.decoder_1(x)
+		dec_2 = self.decoder_2(self.ch_mix_2( torch.cat([enc_4,self.up_1(dec_1)],dim=1) ))
+		dec_3 = self.decoder_3(self.ch_mix_3( torch.cat([enc_3,self.up_2(dec_2)],dim=1) ))
+		dec_4 = self.decoder_4(self.ch_mix_4( torch.cat([enc_2,self.up_3(dec_3)],dim=1) ))
+		dec_5 = self.decoder_5(self.ch_mix_5( torch.cat([enc_1,self.up_4(dec_4)],dim=1) ))
+		return self.out_layer(dec_5)
+
+
+class BaseViTSegDecoder(nn.Module):
+	'''
+	3-stage ViT & 2-stage CNN.
+	'''
+	def __init__(self,channels=32,cnn_layers=2,vit_layers=1,mlp_ratio=4):
+		super().__init__()	
+		up_params = {'kernel_size': 4, 'stride': 2,'padding': 1, 'bias': True}
+
+		self.decoder_1 = ViTBlock(channels*16,num_heads=8,mlp_ratio=mlp_ratio,depth=vit_layers)
+		self.up_1      = nn.ConvTranspose2d(channels*16,channels*8,**up_params)
+
+		self.ch_mix_2  = nn.Conv2d(channels*16,channels*8,1,bias=True)
+		self.decoder_2 = ViTBlock(channels*8,num_heads=4,mlp_ratio=mlp_ratio,depth=vit_layers)
+		self.up_2      = nn.ConvTranspose2d(channels*8,channels*4,**up_params)
+
+		self.ch_mix_3  = nn.Conv2d(channels*8,channels*4,1,bias=True)
+		self.decoder_3 = ViTBlock(channels*4,num_heads=2,mlp_ratio=mlp_ratio,depth=vit_layers)
+		self.up_3      = nn.ConvTranspose2d(channels*4,channels*2,**up_params)
+
+		self.ch_mix_4  = nn.Conv2d(channels*4,channels*2,1,bias=True)
+		self.decoder_4 = ConvBlock(channels*2,depth=cnn_layers)
+		self.up_4      = nn.ConvTranspose2d(channels*2,channels,**up_params)
+
+		self.ch_mix_5  = nn.Conv2d(channels*2,channels,1,bias=True)
+		self.decoder_5 = ConvBlock(channels,depth=cnn_layers)
+
+		self.out_layer = nn.Conv2d(channels,2,kernel_size=1,padding=0)
+
+
+	def forward(self,x,skips):
+		enc_1,enc_2,enc_3,enc_4 = skips
+		dec_1 = self.decoder_1(x)
+		dec_2 = self.decoder_2(self.ch_mix_2( torch.cat([enc_4,self.up_1(dec_1)],dim=1) ))
+		dec_3 = self.decoder_3(self.ch_mix_3( torch.cat([enc_3,self.up_2(dec_2)],dim=1) ))
+		dec_4 = self.decoder_4(self.ch_mix_4( torch.cat([enc_2,self.up_3(dec_3)],dim=1) ))
+		dec_5 = self.decoder_5(self.ch_mix_5( torch.cat([enc_1,self.up_4(dec_4)],dim=1) ))
+		return self.out_layer(dec_5)
+
 
 ################################################################################
 # Time Embeddings
@@ -501,9 +671,9 @@ class TimeEmbedding(nn.Module):
 
 
 ################################################################################
-# MODELS
+# DIFFUSION
 ################################################################################
-class S2SegDiff(nn.Module):
+class ConditionedDenoiser(nn.Module):
 
 	def __init__(self,model_id,cnn_layers=2,vit_layers=1,init_chan_cond=32,init_chan_diff=16,time_dim=256):
 		super().__init__()
@@ -516,14 +686,14 @@ class S2SegDiff(nn.Module):
 
 		# context embeddings
 		context_dims = (init_chan_cond*2,init_chan_cond*4,init_chan_cond*8,init_chan_cond*16)
-		self.cond_encoder  = ConditionEncoder(channels=init_chan_cond,cnn_layers=cnn_layers)
+		self.cond_encoder  = ConditionCNNEncoder(channels=init_chan_cond,cnn_layers=cnn_layers)
 
 		# Denoiser input projection layer to 'channels' argument
 		self.in_layer = nn.Conv2d(2,init_chan_diff,kernel_size=1,stride=1,padding=0,bias=True)
 
 		# Denoising encoder & decoder
-		self.encoder = ViTEncoder(cnn_layers,vit_layers,channels,mlp_ratio,time_dim,context_dims)
-		self.decoder = ViTDecoder(cnn_layers,vit_layers,channels,mlp_ratio,time_dim,context_dims)
+		self.encoder = DenoisingCNNEncoder(cnn_layers,vit_layers,channels,mlp_ratio,time_dim,context_dims)
+		self.decoder = DenoisingCNNDecoder(cnn_layers,vit_layers,channels,mlp_ratio,time_dim,context_dims)
 
 		# final 1x1 classifier
 		self.out_layer = nn.Conv2d(channels,mask_channels,kernel_size=1,bias=True)
@@ -545,6 +715,34 @@ class UnconditionedDenoiser(nn.Module):
 
 	def forward(self,x):
 		pass
+
+
+class BTSegmenter(nn.Module):
+	def __init__(self,model_id,encoder,cnn_layers=2):
+		super().__init__()
+		self.model_id = model_id
+		self.encoder = encoder
+		# DECODER WIDTH FOLLOWS THE ENCODER'S init_chan SO SKIP CHANNELS MATCH
+		self.decoder = BaseCNNSegDecoder(channels=encoder.in_layer.out_channels,cnn_layers=cnn_layers)
+
+	def forward(self,x):
+		skips,x = self.encoder(x) # skips = [c1,c2,c3,c4], x = c5
+		return self.decoder(x,skips)
+
+
+class BaseSegmenter(nn.Module): # TODO --- ADD CHANGEABLE ENCODER/DECODER
+	'''
+	Standard segmentation model supervised learning. Baseline.
+	'''
+	def __init__(self):
+		super().__init__()
+		self.encoder = ConditionCNNEncoder(channels=32,cnn_layers=2)
+		self.decoder = BaseCNNSegDecoder(channels=32,cnn_layers=2)
+
+	def forward(self,x):
+		skips, enc_out = self.encoder(x)
+		dec_out = self.decoder(enc_out,skips)
+		return dec_out
 
 
 ################################################################################
@@ -623,6 +821,7 @@ def _dummy_inputs(model,H,W,batch_size):
 	t   = torch.randint(0,1000,(batch_size,),device=device)
 	rgb = torch.randn(batch_size,in_channels,H,W,device=device)
 	return x_t,t,rgb
+
 
 ################################################################################
 # MAIN

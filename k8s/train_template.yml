@@ -1,0 +1,92 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bt-pretrain-000
+spec:
+
+  backoffLimit: 1
+
+  template:
+    spec:
+
+      tolerations:
+        - key: nautilus.io/reservation
+          operator: Equal
+          value: mizzou
+          effect: NoSchedule
+
+      containers:
+      - name: s2health-trainer
+        image: docker.io/cimartinezvillar/dcnn-pytorch:cuda12.4base-ubuntu22.04
+        imagePullPolicy: Always
+
+        resources:
+          limits:
+            memory: 40Gi
+            cpu: 4
+            ephemeral-storage: 20Gi
+            nvidia.com/a100: 1
+          requests:
+            memory: 40Gi
+            cpu: 4
+            ephemeral-storage: 20Gi
+            nvidia.com/a100: 1
+
+        env:
+          - name: RUN_NAME
+            value: "bt_pretrain"
+          - name: MODEL_ID
+            value: "000"
+          - name: WORKERS
+            value: "4"
+
+        command: ["/bin/sh","-c"]
+        args:
+          - |
+            git clone https://github.com/carlosmartinezvillar/s2-dae && cd s2-dae && exec bash ./k8s/bt_pretrain.sh
+
+        volumeMounts:
+        - mountPath: /chips_pvc
+          name: chips-vol
+        - mountPath: /cache
+          name: cache-vol
+        - mountPath: /model_pvc
+          name: model-vol
+        - mountPath: /log_pvc
+          name: log-vol
+        - mountPath: /dev/shm
+          name: dshm
+
+      volumes:
+      - name: model-vol
+        persistentVolumeClaim:
+          claimName: segdiff-models
+      - name: log-vol
+        persistentVolumeClaim:
+          claimName: segdiff-logs
+      - name: chips-vol
+        persistentVolumeClaim:
+          claimName: s2dw-chips                 
+      - name: cache-vol
+        emptyDir:
+          sizeLimit: 20Gi
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi 
+
+
+      restartPolicy: Never
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                # - NVIDIA-GeForce-RTX-3090 
+                # - NVIDIA-RTX-A6000
+                # - NVIDIA-A100-PCIE-40GB
+                - NVIDIA-A100-SXM4-80GB

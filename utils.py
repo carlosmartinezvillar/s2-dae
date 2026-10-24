@@ -141,3 +141,35 @@ def load_hyperparameters(args,print=False):
 
 	return hp_final
 
+@torch.no_grad()
+def calculate_seg_metrics(confmat):
+	'''
+	Calculate precision, recall, accuracy, and IoU for a confusion matrix tensor.
+	'''
+	# SUM
+	TP = confmat.diagonal()
+	FP = confmat.sum(dim=0) - TP
+	FN = confmat.sum(dim=1) - TP
+	TN = confmat.sum() - TP - FP - FN
+
+	# the metrics
+	ppv = TP / (TP + FP).clamp(min=1) #precision
+	tpr = TP / (TP + FN).clamp(min=1) #recall
+	acc = (TP+TN) / (TP+FN+FP+TN).clamp(min=1) #accuracy
+	iou = TP / (TP + FN + FP).clamp(min=1) #Intersection-over-Union
+	dice = 2*TP/(2*TP+FP+FN).clamp(min=1) #Dice score
+
+	return {'ppv':ppv,'tpr':tpr,'acc':acc,'iou':iou,'dice':dice}
+
+
+@torch.no_grad()
+def update_confusion_matrix(confmat,T,Y,n_classes):
+	'''
+	Update a confusion matrix tensor in gpu. Per-pixel classification.
+	'''
+	# Vectorized to be [0,1,2,3] == [TN,FP,FN,TP]
+	idx = (T.flatten()*n_classes + Y.flatten()).to(torch.int64)
+	# binc = torch.bincount(idx,minlength=n_classes*n_classes)
+	# confmat += binc.view(n_classes,n_classes)
+	confmat.view(-1).index_add_(0,idx,torch.ones_like(idx))
+

@@ -1,5 +1,4 @@
 import os
-import random
 import numpy as np
 import torch
 import torch.nn as nn
@@ -7,10 +6,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import time
 import argparse
-import json
 
 import dataloader
-from utils import 
+import utils
+import models
 from models import BarlowTwins
 
 LOG_DIR   = None
@@ -23,7 +22,7 @@ def parse_args():
 	# DEFINITION
 	parser = argparse.ArgumentParser()
 	required = parser.add_argument_group('Required arguments')
-	required.add_argument('--data-dir',required=True,help='Cache directory with training/ and validation/ built by fast_dataloader.py.')
+	required.add_argument('--data-dir',required=True,help='Directory of .npy cached datasets')
 	required.add_argument('--net-dir',required=True,help='Output dir for trained model weights.')
 	required.add_argument('--log-dir',required=True,help='Output dir for training logs.')
 	required.add_argument('-p','--params',required=True,help='JSON hyperparameter file.')
@@ -31,8 +30,8 @@ def parse_args():
 
 	# OPTIONAL
 	optional = parser.add_argument_group('Optional arguments')
-	optional.add_argument('--workers',required=False,type=int,default=4,help='Set num_workers args.')
-	optional.add_argument('--gpu',required=False,type=int,default=0,help='Override default GPU 0')
+	optional.add_argument('--num-workers',required=False,type=int,default=4,help='Set num_workers args.')
+	optional.add_argument('--device',required=False,type=int,default=0,help='Override default GPU id 0')
 
 	# LOAD
 	args = parser.parse_args ()
@@ -44,13 +43,16 @@ def parse_args():
 	assert os.path.isfile(args.params), f"No hyperparameter found in {args.params}"
 
 	# CHECK OPTIONAL
-	assert args.gpu >= 0, f"Got negative arg for GPU id {args.gpu}"
-	if args.gpu > 0:
-		assert args.gpu < torch.cuda.device_count(), "GPU INDEX OUT OF RANGE."	
+	assert args.device >= 0, f"Got negative arg for GPU id {args.device}"
+	if args.device > 0:
+		assert args.device < torch.cuda.device_count(), "GPU INDEX OUT OF RANGE."
 	# assert args.workers in range(0,9), "Got out of range arg for nr of workers"
 
+	# SET GLOBAL VARS
 	global LOG_DIR
 	global MODEL_DIR
+	LOG_DIR = args.log_dir
+	MODEL_DIR = args.net_dir
 
 	# RETURN
 	return args
@@ -65,7 +67,9 @@ def embedding_std(emb):
 	emb = torch.nn.functional.normalize(emb.float(),dim=1) #unit-length vectors
 	return (emb.std(dim=0).mean() * emb.shape[1]**0.5) # no SYNC need .item() downstream
 
-
+################################################################################
+# TRAIN BT
+################################################################################
 def train(model,gpu_aug,loss_fn,dataloader,optimizer,scheduler,device):
 
 	sums        = torch.zeros(4,device=device)
@@ -100,13 +104,13 @@ def train(model,gpu_aug,loss_fn,dataloader,optimizer,scheduler,device):
 
 	scheduler.step()
 
-	loss,diag,offd,std = (sums/batch_nr).tolist() # >>>>> CPU-GPU SYNC <<<<<
+	loss,diag,offd,std = (sums/batch_count).tolist() # >>>>> CPU-GPU SYNC <<<<<
 	return {'loss':loss,'diag':diag,'offd':offd,'tstd':std}
 
 
 def train_epochs(model,gpu_aug,loss_fn,dataloader,optimizer,scheduler,device,epochs=1000):
 
-	logger  = utils.BTLogger(f'{LOG_DIR}/epochs_{model.model_id:03}.tsv')
+	logger  = utils.BTLogger(f'{LOG_DIR}/bt_{model.model_id:03}.tsv')
 	# tracker = utils.RecentBestTracker(n=3)
 
 	total_time_t0 = time.perf_counter()
@@ -116,18 +120,18 @@ def train_epochs(model,gpu_aug,loss_fn,dataloader,optimizer,scheduler,device,epo
 		epoch_time_t0 = time.perf_counter()
 
 		t_result = train(model,gpu_aug,loss_fn,dataloader,optimizer,scheduler,device)
-		print(f'[T] LOSS: {t_result['loss']:.5f} | ',end='')
-		print(f'ON_DIAG:  {t_result['diag']:.5f} | ',end='')
-		print(f'OFF_DIAG: {t_result['offd']:.5f} | ',end='') 
-		print(f'STD:      {t_result['tstd']:.5f}')
+		print(f"[T] LOSS: {t_result['loss']:.5f} | ",end='')
+		print(f"ON_DIAG:  {t_result['diag']:.5f} | ",end='')
+		print(f"OFF_DIAG: {t_result['offd']:.5f} | ",end='')
+		print(f"STD:      {t_result['tstd']:.5f}")
 		
 		logger.log(t_result)
 
-		epoch_time_t0 = time.perf_counter()
+		epoch_time_t1 = time.perf_counter()
 
 	print(f"Epoch time: {epoch_time_t1-epoch_time_t0:.2f} secs.")
 
-	path = save_checkpoint(MODEL_DIR,model,optimizer,epoch,epoch_results,tag='last')
+	path = utils.save_checkpoint(MODEL_DIR,model,optimizer,epoch,tag='bt')
 
 	total_time_t1 = time.perf_counter()
 	print(f'Total time: {(total_time_t1-total_time_t0)/60:.1f} min.')
@@ -135,22 +139,33 @@ def train_epochs(model,gpu_aug,loss_fn,dataloader,optimizer,scheduler,device,epo
 	print(f'Peak GPU memory allocated: {mem_gb:.2f} GB')
 
 
+################################################################################
+# SETUP/MAIN
+################################################################################
 if __name__ == '__main__':
 	args = parse_args()
-	hp   = utils.load_hyperparameters(args.params)
+	hp   = utils.load_hyperparameters(args)
 	utils.set_seed(hp['seed'])
 	device = torch.device(f'cuda:{args.device}')
 
-	bt_net = model.BarlowTwins(
+	bt_net = BarlowTwins(
 		model_id=hp['id'],
 		init_chan=hp['init_chan'],
 		cnn_layers=hp['cnn_layers'],
-		proj_dim=hp['proj_dim']
+		proj_dim=hp['proj_dim'],
+		encoder=hp.get('encoder','cnn')
 	).to(device)
-	torch.compile(bt_net)
+	bt_net = torch.compile(bt_net)
 
 	loss_fn = models.BarlowTwinsLoss(proj_dim=hp['proj_dim'],lambd=hp['bt_lambda']).to(device)
-	optimizer = torch.optim.AdamW(bt_net.parameters(),lr=hp['lrate'],weight_decay=hp['decay'])
+
+	# NO DECAY ON NORM WEIGHTS AND BIASES (ndim < 2)
+	decay_params    = [p for p in bt_net.parameters() if p.ndim >= 2]
+	no_decay_params = [p for p in bt_net.parameters() if p.ndim < 2]
+	optimizer = torch.optim.AdamW([
+		{'params':decay_params,'weight_decay':hp['decay']},
+		{'params':no_decay_params,'weight_decay':0.0}],
+		lr=hp['lrate'])
 
 	# SCHEDULER -- COSINE ANNEALING W/O RESTARTS
 	warmup_steps = 10
@@ -160,7 +175,7 @@ if __name__ == '__main__':
 	cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=cosine_steps,eta_min=min_rate)
 	scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer,schedulers=[warmup_sched,cosine_sched],milestones=[warmup_steps])
 
-	bands,_ = dataloader.load_cached_split(args.data_dir,split='train')
+	bands,_ = dataloader.load_cached_split(args.data_dir,split='training')
 	gpu_aug = dataloader.GPUPairedTransform(crop=192).to(device) #BT augmentations
 	# gpu_norm = dataloader.GPUValidationTransform().to(device)
 	dloader = DataLoader(
