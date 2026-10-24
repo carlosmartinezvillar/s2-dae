@@ -137,8 +137,43 @@ def validate(model,gpu_norm,dataloader,loss_fn,device):
 
 
 def train_and_validate(model,gpu_aug,gpu_norm,dataloaders,loss_fn,optimizer,scheduler,device,epochs=100)
+	logger = utils.SegmentationLogger(f'{LOG_DIR}/probe_{model.model_id:03}.tsv')
+	tracker = utils.RecentBestTracker(n=1)
+	best_iou = 0.0
+	best_epoch = 0
 
+	total_time_t0 = time.perf_counter()
 
+	for epoch in range(epochs):
+
+		print(f'--- EPOCH {epoch:04} ---')
+		epoch_time_t0 = time.perf_counter()
+		tr_result = train(model,gpu_aug,dataloaders['training'],loss_fn,optimizer,scheduler,device)
+		va_result = validate(model,gpu_norm,dataloaders['validation'],loss_fn,device)
+		epoch_time_t1 = time.perf_counter()
+
+		logger.log({'epoch':epoch,**tr_result,**va_result})
+		print(f"[T] LOSS: {tr_result['tloss']:.5f} | [V] LOSS: {va_result['vloss']:.5f} | IoU_1: {va_result['iou_1']:.5f}")
+
+		# SKIP WARMUP; FOREGROUND (CLASS 1) IoU SELECTS THE BEST
+		if (epoch+1)>10 and va_result['iou_1'] > best_iou:
+			best_iou = va_result['iou_1']
+			best_epoch = epoch
+			pth_path = utils.save_checkpoint(MODEL_DIR,model,optimizer,epoch,tag='probe')
+			tracker.update(pth_path)
+
+		# STDOUT LOG EPOCH TIME
+		print(f"Epoch time: {epoch_time_t1-epoch_time_t0:.2f} secs.")
+
+	total_time_t1 = time.perf_counter()
+	mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+	# STDOUT LOG OVERALL
+	print(f'Total time: {(total_time_t1-total_time_t0)/60:.1f} min')
+	print(f'Best epoch: {best_epoch} | IoU: {best_iou:.5f}')
+	print(f'Peak GPU memory allocated: {mem_gb:.2f} GB')
+
+	
 if __name__ == '__main__':
 
 	# PARSE ARGS/FILES, SET SEED
