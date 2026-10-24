@@ -734,10 +734,12 @@ class BaseSegmenter(nn.Module): # TODO --- ADD CHANGEABLE ENCODER/DECODER
 	'''
 	Standard segmentation model supervised learning. Baseline.
 	'''
-	def __init__(self):
+	def __init__(self,channels=32,cnn_layers=2):
 		super().__init__()
-		self.encoder = ConditionCNNEncoder(channels=32,cnn_layers=2)
-		self.decoder = BaseCNNSegDecoder(channels=32,cnn_layers=2)
+		self.encoder = ConditionCNNEncoder(channels=channels,cnn_layers=cnn_layers)
+		# self.encoder = ConditionViTEncoder(channels=channels,cnn_layers=cnn_layers)
+		self.decoder = BaseCNNSegDecoder(channels=channels,cnn_layers=cnn_layers)
+		# self.decoder = BaseViTSegDecoder(channels=channels,cnn_layers=cnn_layers)
 
 	def forward(self,x):
 		skips, enc_out = self.encoder(x)

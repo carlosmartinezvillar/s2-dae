@@ -88,7 +88,8 @@ def load_encoder_checkpoint(hp,epoch=None):
 		model_id=bt_id,
 		init_chan=hp['init_chan'],
 		cnn_layers=hp['cnn_layers'],
-		proj_dim=hp['proj_dim']
+		proj_dim=hp['proj_dim'],
+		encoder=hp.get('encoder','cnn')
 	)
 	bt_net.load_state_dict(checkpoint['model_state_dict'],strict=True)
 
@@ -96,6 +97,7 @@ def load_encoder_checkpoint(hp,epoch=None):
 
 	# KEEP ENCODER, DROP PROJECTOR
 	return bt_net.encoder
+
 
 ################################################################################
 # FINE-TUNING

@@ -22,11 +22,29 @@ def set_seed(seed: int):
 
 
 ################################################################################
+# BEST SUPERVISED BASELINES -- s2dw-lakes-dataset (models/results.py), 3 BANDS (RGB)
+################################################################################
+# Stage 1: 40 random trials/model (lrate, decay, batch 8|16, 35 epochs); stage 2: top 3 x 5 seeds;
+# stage 3 picks (ids 000,055,018,065): AdamW (decay on all params), CE, 5-epoch warmup + cosine to 0, 65 epochs.
+# Stage 4 test IoU (%) Tiny/Small/Base/Large -- CNN-CNN 89.14/89.73/90.06/89.76 | ViT-CNN 89.36/89.85/88.89/89.82
+#   | CNN-ViT 89.81/90.46/90.42/90.76 | ViT-ViT 89.74/90.57/90.63/90.94 (best overall: ViT-ViT Large).
+# Sizes (channels,cnn_layers,vit_layers): Tiny (16,2,1), Small (16,3,2), Base (32,2,1), Large (32,3,2);
+#   stage 4 trained all sizes for 100 epochs with lrate 2e-4 and each model's decay rounded (8e-3, 5e-3, 8e-3, 1e-2).
+LAKES_BEST = {
+    'UNet_CNN_CNN': {'lrate': 2.2e-4, 'decay': 8.37e-3, 'batch': 16, 'channels': 32, 'cnn_layers': 2, 'vit_layers': 1, 'mlp_ratio': 5, 'epochs': 65},
+    'UNet_ViT_CNN': {'lrate': 2.0e-4, 'decay': 5.0e-3,  'batch': 16, 'channels': 32, 'cnn_layers': 2, 'vit_layers': 1, 'mlp_ratio': 5, 'epochs': 65},
+    'UNet_CNN_ViT': {'lrate': 2.0e-4, 'decay': 7.86e-3, 'batch': 16, 'channels': 32, 'cnn_layers': 2, 'vit_layers': 1, 'mlp_ratio': 5, 'epochs': 65},
+    'UNet_ViT_ViT': {'lrate': 2.0e-4, 'decay': 1.0e-2,  'batch': 16, 'channels': 32, 'cnn_layers': 2, 'vit_layers': 1, 'mlp_ratio': 5, 'epochs': 65},
+}
+
+
+################################################################################
 # BARLOW TWINS
 ################################################################################
-def set_experiments_bt_pretrain(n=30, epochs=500, seed=476, path='./hpo/bt_pretrain.json'):
+def set_experiments_bt_pretrain(n=20, epochs=500, seed=476, path='./hpo/bt_pretrain.json'):
     '''
-    n random optimizer/loss samples for each architecture (proj_dim x init_chan), fixed batch.
+    n random optimizer/loss samples for each architecture (encoder x proj_dim x init_chan), fixed batch.
+    encoder: 'cnn' -> ConditionCNNEncoder, 'vit' -> ConditionViTEncoder.
     base_lrate is the lr at the reference batch (256). AdamW square-root scaling:
     lrate = base_lrate * sqrt(batch/256), so base_lrate stays comparable if batch is changed later.
     '''
@@ -43,18 +61,18 @@ def set_experiments_bt_pretrain(n=30, epochs=500, seed=476, path='./hpo/bt_pretr
     batch = 256
     ref_batch = 256
     cnn_layers = 2
-    encoder_type = 'cnn'
 
 
-    # ARCHITECTURES (representation dim = 16*init_chan)
+    # ARCHITECTURES (representation dim = 16*init_chan for both encoders)
     grid = []
-    for proj_dim in [2048, 4096, 8192]:
-        for init_chan in [32, 48]:
-            grid.append((proj_dim, init_chan))
+    for encoder_type in ['cnn', 'vit']:
+        for proj_dim in [2048, 4096, 8192]:
+            for init_chan in [32, 48]:
+                grid.append((encoder_type, proj_dim, init_chan))
 
     i = 0
     with open(path, 'w') as fp:
-        for proj_dim, init_chan in grid:
+        for encoder_type, proj_dim, init_chan in grid:
             for _ in range(n):
 
                 exp = {k: sample(v) for k, v in space.items()}
@@ -75,13 +93,15 @@ def set_experiments_bt_pretrain(n=30, epochs=500, seed=476, path='./hpo/bt_pretr
                 i += 1
 
 
-def set_experiments_bt_train(bt_id, n=30, epochs=100, seed=476, path='./hpo/bt_whole.json', bt_path='./hpo/bt_pretrain.json'):
+def set_experiments_bt_train(bt_id, n=40, epochs=100, seed=476, path='./hpo/bt_whole.json', bt_path='./hpo/bt_pretrain.json'):
     '''
     n random fine-tuning samples for the whole BTSegmenter, starting from BT checkpoint bt_id
     (the best encoder from the probe). The BT architecture keys are copied from its row in
     bt_path so validate_condition.py can rebuild BarlowTwins and load the checkpoint strictly.
-    base_lrate is the lr at the reference batch (32); lrate = base_lrate * sqrt(batch/32).
+    base_lrate is the lr at the reference batch (16); lrate = base_lrate * sqrt(batch/16).
     enc_lrate = lrate * enc_ratio for the pre-trained encoder (1.0 = same lrate as decoder).
+    Ranges are centred on the supervised optimum in LAKES_BEST (lrate ~2e-4, decay 5e-3..1e-2 at batch 16);
+    n=40 matches the 40 stage-1 trials per model the baselines got.
     '''
     set_seed(seed)
 
@@ -92,14 +112,14 @@ def set_experiments_bt_train(bt_id, n=30, epochs=100, seed=476, path='./hpo/bt_w
     bt_arch = {k: bt_rows[bt_id][k] for k in ('init_chan', 'cnn_layers', 'proj_dim', 'encoder')}
 
     space = {
-        'base_lrate': ('log', 1e-4, 3e-3),       # lr at batch 32
+        'base_lrate': ('log', 5e-5, 1e-3),       # lr at batch 16
         'enc_ratio':  ('choice', [0.1, 0.3, 1.0]),
-        'decay':      ('log', 1e-4, 1e-1),       # decoupled AdamW decay; norm weights/biases excluded
-        'batch':      ('choice', [16, 32, 64]),
+        'decay':      ('log', 1e-4, 3e-2),       # decoupled AdamW decay; norm weights/biases excluded
+        'batch':      ('choice', [16, 32, 48]),
     }
 
-    # FIXED
-    ref_batch = 32
+    # FIXED: AdamW (no decay on norm/bias), CE loss, 10-epoch warmup + cosine, grad clip 1.0, bf16, 4 bands, CNN decoder, dihedral+gain aug, best epoch by val IoU_1
+    ref_batch = 16
     decoder_type = 'cnn' # BTSegmenter only has BaseCNNSegDecoder for now
 
     with open(path, 'w') as fp:
