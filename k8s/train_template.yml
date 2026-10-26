@@ -60,7 +60,7 @@ spec:
       volumes:
       - name: model-vol
         persistentVolumeClaim:
-          claimName: segdiff-models
+          claimName: segdiff-checkpoints
       - name: log-vol
         persistentVolumeClaim:
           claimName: segdiff-logs

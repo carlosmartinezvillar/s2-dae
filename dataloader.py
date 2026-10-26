@@ -10,6 +10,7 @@ import os
 import tifffile as tiff
 import numpy as np
 import time
+import argparse
 
 MEAN = torch.tensor([123.305154,132.731427,131.599954,115.507302]).view(-1,1,1)
 STDD = torch.tensor([53.223368,51.529520,53.707588,55.610260]).view(-1,1,1)
@@ -22,7 +23,7 @@ def build_cached_dataset(chip_dir,cache_dir,split):
 	# splits = ("training","validation","testing")
 
 	band_files = sorted(glob.glob(f"{chip_dir}/{split}/*_B0X.tif"))
-	chips = [i[0:-8] for i in band_files]
+	chips = [os.path.basename(i)[0:-8] for i in band_files] # CHIP NAMES ONLY, glob RETURNS FULL PATHS
 	n = len(chips)
 
 	# BUFFER
@@ -30,7 +31,7 @@ def build_cached_dataset(chip_dir,cache_dir,split):
 	mask = np.lib.format.open_memmap(f"{cache_dir}/{split}_masks.npy",mode='w+',dtype=np.uint8,shape=(n,256,256))
 
 	for i,c in enumerate(chips):
-		vnir[i] = tiff.imread(f"{chip_dir}/{split}/{c}_B0X.tif")
+		vnir[i] = tiff.imread(f"{chip_dir}/{split}/{c}_B0X.tif").transpose(2,0,1) # HWC -> CHW
 		mask[i] = tiff.imread(f"{chip_dir}/{split}/{c}_LBL.tif")
 
 	for arr in (vnir,mask):
@@ -377,8 +378,12 @@ class TwinFastDataset(torch.utils.data.Dataset):
 
 
 if __name__ == '__main__':
-	args.data_dir = None
-	args.cache_dir = None
+	parser = argparse.ArgumentParser()
+	parser.add_argument('--data-dir',required=True,help='Directory of chip dataset')
+	parser.add_argument('--cache-dir',required=True,help='Directory of output .npy cached datasets')
+	args = parser.parse_args()
+	args.data_dir = args.data_dir.rstrip('/')
+	args.cache_dir = args.cache_dir.rstrip('/')
 	splits = ("training","validation","testing")
 	for s in splits:
 		build_cached_dataset(args.data_dir,args.cache_dir,s)
