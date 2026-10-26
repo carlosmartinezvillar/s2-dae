@@ -76,7 +76,7 @@ trap 'exit 143' TERM INT
 
 # BACKGROUND + wait: BASH DEFERS TRAPS UNTIL A FOREGROUND COMMAND RETURNS, BUT
 # wait IS INTERRUPTED BY THEM. wait $! STILL RETURNS THE PIPEFAIL STATUS.
-python3 -u train.py \
+python3 -u pretrain_condition.py \
   --data-dir "$DATA_DIR" \
   --net-dir "$NET_DIR" \
   --log-dir "$LOG_DIR" \
