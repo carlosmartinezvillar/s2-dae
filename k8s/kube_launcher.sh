@@ -46,7 +46,7 @@ set -euo pipefail
 ################################################################################
 # SETTINGS
 ################################################################################
-TEMPLATE="${TEMPLATE:-k8s/train_template.yml}"
+TEMPLATE="${TEMPLATE:-k8s/bt_train_template.yml}"
 SCRIPT="${SCRIPT:-bt_pretrain.sh}"
 DRY_RUN="${DRY_RUN:-0}"
 ASSUME_YES="${ASSUME_YES:-0}"

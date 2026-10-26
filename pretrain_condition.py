@@ -123,13 +123,12 @@ def train_epochs(model,gpu_aug,loss_fn,dataloader,optimizer,scheduler,device,epo
 		print(f"[T] LOSS: {t_result['loss']:.5f} | ",end='')
 		print(f"ON_DIAG:  {t_result['diag']:.5f} | ",end='')
 		print(f"OFF_DIAG: {t_result['offd']:.5f} | ",end='')
-		print(f"STD:      {t_result['tstd']:.5f}")
+		print(f"STD:{t_result['tstd']:.5f}")
 		
 		logger.log(t_result)
 
 		epoch_time_t1 = time.perf_counter()
-
-	print(f"Epoch time: {epoch_time_t1-epoch_time_t0:.2f} secs.")
+		print(f"Epoch time: {epoch_time_t1-epoch_time_t0:.2f} secs.")
 
 	path = utils.save_checkpoint(MODEL_DIR,model,optimizer,epoch,tag='bt')
 
@@ -185,7 +184,7 @@ if __name__ == '__main__':
 		batch_size=hp['batch'],
 		num_workers=args.num_workers,
 		pin_memory=True,
-		prefetch_factor=4,
+		prefetch_factor=8,
 		persistent_workers=True
 	)
 
