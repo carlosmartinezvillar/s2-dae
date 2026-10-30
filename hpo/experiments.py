@@ -31,10 +31,10 @@ def set_seed(seed: int):
 # Sizes (channels,cnn_layers,vit_layers): Tiny (16,2,1), Small (16,3,2), Base (32,2,1), Large (32,3,2);
 #   stage 4 trained all sizes for 100 epochs with lrate 2e-4 and each model's decay rounded (8e-3, 5e-3, 8e-3, 1e-2).
 LAKES_BEST = {
-    'UNet_CNN_CNN': {'lrate': 2.2e-4, 'decay': 8.37e-3, 'batch': 16, 'channels': 32, 'cnn_layers': 2, 'vit_layers': 1, 'mlp_ratio': 5, 'epochs': 65},
-    'UNet_ViT_CNN': {'lrate': 2.0e-4, 'decay': 5.0e-3,  'batch': 16, 'channels': 32, 'cnn_layers': 2, 'vit_layers': 1, 'mlp_ratio': 5, 'epochs': 65},
-    'UNet_CNN_ViT': {'lrate': 2.0e-4, 'decay': 7.86e-3, 'batch': 16, 'channels': 32, 'cnn_layers': 2, 'vit_layers': 1, 'mlp_ratio': 5, 'epochs': 65},
-    'UNet_ViT_ViT': {'lrate': 2.0e-4, 'decay': 1.0e-2,  'batch': 16, 'channels': 32, 'cnn_layers': 2, 'vit_layers': 1, 'mlp_ratio': 5, 'epochs': 65},
+    'UNet_CNN_CNN': {'lrate': 2.2e-4, 'decay': 8.37e-3, 'batch': 16, 'channels': 32, 'cnn_layers': 2, 'vit_layers': 1, 'mlp_ratio': 4, 'epochs': 100},
+    'UNet_ViT_CNN': {'lrate': 2.0e-4, 'decay': 5.0e-3,  'batch': 16, 'channels': 32, 'cnn_layers': 2, 'vit_layers': 1, 'mlp_ratio': 4, 'epochs': 100},
+    'UNet_CNN_ViT': {'lrate': 2.0e-4, 'decay': 7.86e-3, 'batch': 16, 'channels': 32, 'cnn_layers': 2, 'vit_layers': 1, 'mlp_ratio': 4, 'epochs': 100},
+    'UNet_ViT_ViT': {'lrate': 2.0e-4, 'decay': 1.0e-2,  'batch': 16, 'channels': 32, 'cnn_layers': 2, 'vit_layers': 1, 'mlp_ratio': 4, 'epochs': 100},
 }
 
 
@@ -162,12 +162,21 @@ def set_experiments_bt_train(bt_id, bt_run='bt_pretrain_long', n=40, epochs=100,
 ################################################################################
 # DIFFUSION
 ################################################################################
-def set_experiments_unguided_train(n=30,epochs=500,seed=476,path='./hpo/unguided.json'):
+def set_experiments_diff_train(n=30,epochs=500,seed=476,path='./hpo/diff_train.json'):
+    '''
+    Unguided diffusion models. List of experiments searches hyperparameter space for
+    a semantic segmentation model with pre-trained weights. Pre-trained weights are
+    transfered from an unguided diffusion model.
+    '''
 	set_seed(seed)
 	return
 
 
-def set_experiments_unguided(n=30,epochs=500,seed=476,path='./hpo/unguided.json'):
+def set_experiments_diff_pretrain(n=30,epochs=500,seed=476,path='./hpo/diff_pretrain.json'):
+    '''
+    Unguided diffusion models. List of experiments searches the hyperparameter space
+    among these.
+    '''
 	set_seed(seed)
 	return
 
