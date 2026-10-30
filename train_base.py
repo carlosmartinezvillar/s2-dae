@@ -1,3 +1,8 @@
+'''
+Train a basic encoder-decoder U-Net for semantic segmentation.
+Encoder-decoder combinations vary between CNN-ViT, ViT-CNN, ViT-ViT, and CNN-CNN.
+'''
+
 import os
 import glob
 import numpy as np
@@ -136,7 +141,7 @@ def validate(model,gpu_norm,dataloader,loss_fn,device):
 	return flat_result
 
 
-def train_and_validate(model,gpu_aug,gpu_norm,dataloaders,loss_fn,optimizer,scheduler,device,epochs=100)
+def train_and_validate(model,gpu_aug,gpu_norm,dataloaders,loss_fn,optimizer,scheduler,device,epochs=100):
 	logger = utils.SegmentationLogger(f'{LOG_DIR}/probe_{model.model_id:03}.tsv')
 	tracker = utils.RecentBestTracker(n=1)
 	best_iou = 0.0

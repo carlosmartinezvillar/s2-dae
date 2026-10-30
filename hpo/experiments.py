@@ -93,11 +93,29 @@ def set_experiments_bt_pretrain(n=20, epochs=500, seed=476, path='./hpo/bt_pretr
                 i += 1
 
 
-def set_experiments_bt_train(bt_id, n=40, epochs=100, seed=476, path='./hpo/bt_whole.json', bt_path='./hpo/bt_pretrain.json'):
+def set_experiments_bt_pretrain_long(bt_id, epochs=1000, path='./hpo/bt_pretrain_long.json', bt_path='./hpo/bt_pretrain.json'):
+    '''
+    Long BT pretraining of the best encoder from the probe: row bt_id of bt_path, unchanged
+    except for epochs. id stays bt_id, so the checkpoint is bt_{bt_id:03}_e{epochs-1:04}.pth.tar
+    and fine-tuning rows keep the same bt_id. Launch with:
+      ./k8s/kube_launcher.sh bt_pretrain ./hpo/bt_pretrain_long.json <bt_id> <bt_id>
+    '''
+    with open(bt_path, 'r') as fp:
+        bt_rows = {row['id']: row for row in map(json.loads, fp) if row}
+    assert bt_id in bt_rows, f"BT id {bt_id} not in {bt_path}"
+
+    exp = dict(bt_rows[bt_id], epochs=epochs)
+    with open(path, 'w') as fp:
+        fp.write(json.dumps(exp) + '\n')
+
+
+def set_experiments_bt_train(bt_id, bt_run='bt_pretrain_long', n=40, epochs=100, seed=476, path='./hpo/bt_train.json'):
     '''
     n random fine-tuning samples for the whole BTSegmenter, starting from BT checkpoint bt_id
-    (the best encoder from the probe). The BT architecture keys are copied from its row in
-    bt_path so validate_condition.py can rebuild BarlowTwins and load the checkpoint strictly.
+    of run bt_run (default: the long pretraining of the best encoder from the probe). The BT
+    architecture keys are copied from its row in ./hpo/{bt_run}.json so train_condition.py can
+    rebuild BarlowTwins and load the checkpoint strictly; bt_run tells k8s/bt_train.sh which
+    /model_pvc/<run> folder holds that checkpoint.
     base_lrate is the lr at the reference batch (16); lrate = base_lrate * sqrt(batch/16).
     enc_lrate = lrate * enc_ratio for the pre-trained encoder (1.0 = same lrate as decoder).
     Ranges are centred on the supervised optimum in LAKES_BEST (lrate ~2e-4, decay 5e-3..1e-2 at batch 16);
@@ -106,6 +124,7 @@ def set_experiments_bt_train(bt_id, n=40, epochs=100, seed=476, path='./hpo/bt_w
     set_seed(seed)
 
     # BT ARCHITECTURE OF THE SELECTED ENCODER
+    bt_path = f'./hpo/{bt_run}.json'
     with open(bt_path, 'r') as fp:
         bt_rows = {row['id']: row for row in map(json.loads, fp) if row}
     assert bt_id in bt_rows, f"BT id {bt_id} not in {bt_path}"
@@ -135,7 +154,7 @@ def set_experiments_bt_train(bt_id, n=40, epochs=100, seed=476, path='./hpo/bt_w
                 exp[k] = float(f"{exp[k]:.3g}")
 
             exp.update(bt_arch)
-            exp.update({'id': i, 'bt_id': bt_id, 'seed': seed, 'epochs': epochs})
+            exp.update({'id': i, 'bt_id': bt_id, 'bt_run': bt_run, 'seed': seed, 'epochs': epochs})
             fp.write(json.dumps(exp) + '\n')
 
 

@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: bt-pretrain-000
+  name: bt-train-000
 spec:
 
   backoffLimit: 1
@@ -16,7 +16,7 @@ spec:
           effect: NoSchedule
 
       containers:
-      - name: s2health-trainer
+      - name: train-box
         image: docker.io/cimartinezvillar/dcnn-pytorch:cuda12.4base-ubuntu22.04
         imagePullPolicy: Always
 
@@ -34,7 +34,7 @@ spec:
 
         env:
           - name: RUN_NAME
-            value: "bt_pretrain"
+            value: "bt_train"
           - name: MODEL_ID
             value: "000"
           - name: WORKERS
@@ -43,7 +43,7 @@ spec:
         command: ["/bin/sh","-c"]
         args:
           - |
-            git clone https://github.com/carlosmartinezvillar/s2-dae && cd s2-dae && exec bash ./k8s/bt_pretrain.sh
+            git clone https://github.com/carlosmartinezvillar/s2-dae && cd s2-dae && exec bash ./k8s/bt_train.sh
 
         volumeMounts:
         - mountPath: /chips_pvc

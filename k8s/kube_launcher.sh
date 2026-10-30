@@ -2,10 +2,13 @@
 
 # Launch one Kubernetes Job per model id over a range of ids from a hyperparameter file.
 #
-#   ./k8s/kube_launcher.sh ./hpo/bt_pretrain.json 0 239
+#   ./k8s/kube_launcher.sh bt_pretrain ./hpo/bt_pretrain.json 0 239
+#
+# The first argument names the pod script k8s/<script>.sh (".sh" and a "k8s/"
+# prefix are optional) and, through it, the template k8s/<script>_template.yml.
 #
 # WHAT HAPPENS, END TO END
-#   1. This script (on your laptop) reads the template k8s/train_template.yml and
+#   1. This script (on your laptop) reads the template k8s/<script>_template.yml and
 #      renders one copy per id, changing only the fields listed below.
 #   2. Each rendered Job is submitted with kubectl. On the cluster the pod runs
 #        git clone .../s2-dae && cd s2-dae && exec bash ./k8s/bt_pretrain.sh
@@ -25,15 +28,16 @@
 # be a string and rejects a bare integer.
 #
 # Env (all optional):
-#   TEMPLATE=<path>   job template to render     (default: k8s/train_template.yml)
-#   SCRIPT=<name>     script in k8s/ the pod runs (default: bt_pretrain.sh)
+#   TEMPLATE=<path>   job template to render     (default: k8s/<script>_template.yml)
 #   DRY_RUN=1         render and print, submit nothing
 #   ASSUME_YES=1      skip the confirmation prompt
 #   ALLOW_DIRTY=1     submit even if the remote does not match the working tree
 #
 # Examples:
-#   DRY_RUN=1 ./k8s/kube_launcher.sh ./hpo/bt_pretrain.json 0 1     # inspect two manifests
-#   ./k8s/kube_launcher.sh ./hpo/bt_pretrain.json 120 239           # ViT rows only
+#   DRY_RUN=1 ./k8s/kube_launcher.sh bt_pretrain ./hpo/bt_pretrain.json 0 1   # inspect two manifests
+#   ./k8s/kube_launcher.sh bt_pretrain ./hpo/bt_pretrain.json 120 239         # ViT rows only
+#   ./k8s/kube_launcher.sh bt_probe ./hpo/bt_probe.json 0 239                 # probe every BT encoder
+#   ./k8s/kube_launcher.sh bt_train ./hpo/bt_train.json 0 39                  # fine-tune one BT encoder
 #
 # Useful follow-ups:
 #   kubectl get jobs | grep bt-pretrain                 # status
@@ -46,8 +50,6 @@ set -euo pipefail
 ################################################################################
 # SETTINGS
 ################################################################################
-TEMPLATE="${TEMPLATE:-k8s/bt_train_template.yml}"
-SCRIPT="${SCRIPT:-bt_pretrain.sh}"
 DRY_RUN="${DRY_RUN:-0}"
 ASSUME_YES="${ASSUME_YES:-0}"
 ALLOW_DIRTY="${ALLOW_DIRTY:-0}"
@@ -111,20 +113,24 @@ check_git_sync() {
 # ARGUMENTS
 ################################################################################
 usage() {
-  echo "usage: $0 <params-file> <start-id> <end-id>" >&2
-  echo "   e.g: $0 ./${PARAMS_DIRNAME}/bt_pretrain.json 0 239" >&2
+  echo "usage: $0 <script> <params-file> <start-id> <end-id>" >&2
+  echo "   e.g: $0 bt_probe ./${PARAMS_DIRNAME}/bt_probe.json 0 239" >&2
   exit 2
 }
 
-[ "$#" -eq 3 ] || usage
-PARAMS_FILE="$1"
-START_ID="$2"
-END_ID="$3"
+[ "$#" -eq 4 ] || usage
+SCRIPT="$(basename "$1" .sh).sh"  # bt_probe, bt_probe.sh AND k8s/bt_probe.sh ALL GIVE bt_probe.sh
+PARAMS_FILE="$2"
+START_ID="$3"
+END_ID="$4"
+
+# EACH k8s/<name>.sh HAS ITS OWN k8s/<name>_template.yml
+TEMPLATE="${TEMPLATE:-k8s/${SCRIPT%.sh}_template.yml}"
 
 # VALIDATE ARGS
 [ -f "$PARAMS_FILE" ]  || die "params file not found: $PARAMS_FILE"
 [ -f "$TEMPLATE" ]     || die "template not found: $TEMPLATE (override with TEMPLATE=<path>)"
-[ -f "k8s/$SCRIPT" ]   || die "script not found: k8s/$SCRIPT (override with SCRIPT=<name>; run from the repo root)"
+[ -f "k8s/$SCRIPT" ]   || die "script not found: k8s/$SCRIPT (run from the repo root)"
 [[ "$START_ID" =~ ^[0-9]+$ ]] || die "start-id must be a non-negative integer, got '$START_ID'"
 [[ "$END_ID"   =~ ^[0-9]+$ ]] || die "end-id must be a non-negative integer, got '$END_ID'"
 [ "$START_ID" -le "$END_ID" ] || die "start-id ($START_ID) is greater than end-id ($END_ID)"
