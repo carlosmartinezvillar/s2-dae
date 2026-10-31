@@ -448,18 +448,22 @@ class GuidedDenoisingCNNEncoder(nn.Module):
 class GuidedDenoisingViTEncoder(nn.Module):
 	'''
 	Hybrid CNN/ViT without positional encoding. 2xCNN + 3xViT layers.
-	All blocks timestep-conditioned.
+	All blocks timestep-conditioned, context at every stage: added in the CNN
+	stages (c1,c2), cross-attended in the ViT stages (c3,c4,c5).
+	context_dims: BT encoder channels at c1..c5 (e.g. init_chan*(1,2,4,8,16)).
+	Stage names match UnguidedDenoisingViTEncoder, so its weights load here with
+	only context_proj, cross_attn and norm_context missing (all start with no effect).
 	'''
 
-	def __init__(self,cnn_layers=3,vit_layers=1,channels=32,mlp_ratio=4,time_dim=256,context_dims=(128,256,512)):
+	def __init__(self,cnn_layers=3,vit_layers=1,channels=32,mlp_ratio=4,time_dim=256,context_dims=(32,64,128,256,512)):
 		super().__init__()
 		down_params = {'kernel_size': 3, 'stride': 2, 'padding': 1, 'bias': True}
 
-		c3_dim,c4_dim,c5_dim = context_dims
+		c1_dim,c2_dim,c3_dim,c4_dim,c5_dim = context_dims
 
-		self.encoder_1 = TimeConvBlock(channels,time_dim,depth=cnn_layers) #32
+		self.encoder_1 = ContextCNNBlock(channels,time_dim,c1_dim,depth=cnn_layers) #32
 		self.down_1    = nn.Conv2d(channels,channels*2,**down_params)
-		self.encoder_2 = TimeConvBlock(channels*2,time_dim,depth=cnn_layers)
+		self.encoder_2 = ContextCNNBlock(channels*2,time_dim,c2_dim,depth=cnn_layers)
 		self.down_2    = nn.Conv2d(channels*2,channels*4,**down_params)
 		self.encoder_3 = ContextViTBlock(channels*4,num_heads=2,time_dim=time_dim,context_dim=c3_dim,mlp_ratio=mlp_ratio,depth=vit_layers)		
 		self.down_3    = nn.Conv2d(channels*4,channels*8,**down_params)
@@ -468,9 +472,9 @@ class GuidedDenoisingViTEncoder(nn.Module):
 		self.encoder_5 = ContextViTBlock(channels*16,num_heads=8,time_dim=time_dim,context_dim=c5_dim,mlp_ratio=mlp_ratio,depth=vit_layers)	
 
 	def forward(self,x,t_emb,context):
-		(_,_,c3,c4),c5 = context # BT ENCODER OUTPUT: ([c1,c2,c3,c4],c5)
-		enc_1 = self.encoder_1(x,t_emb)
-		enc_2 = self.encoder_2(self.down_1(enc_1),t_emb)
+		(c1,c2,c3,c4),c5 = context # BT ENCODER OUTPUT: ([c1,c2,c3,c4],c5)
+		enc_1 = self.encoder_1(x,t_emb,c1)
+		enc_2 = self.encoder_2(self.down_1(enc_1),t_emb,c2)
 		enc_3 = self.encoder_3(self.down_2(enc_2),t_emb,c3)
 		enc_4 = self.encoder_4(self.down_3(enc_3),t_emb,c4)
 		enc_5 = self.encoder_5(self.down_4(enc_4),t_emb,c5)
@@ -606,12 +610,16 @@ class GuidedDenoisingCNNDecoder(nn.Module):
 
 class GuidedDenoisingViTDecoder(nn.Module):
 	'''
-	3-stage ViT & 2-stage CNN. Mirrors ViTEncoder().
+	3-stage ViT & 2-stage CNN. Mirrors GuidedDenoisingViTEncoder: context at every
+	stage, cross-attended in the ViT stages (c5,c4,c3), added in the CNN stages (c2,c1).
+	context_dims: BT encoder channels at c1..c5. Returns features at 'channels' width.
+	Stage names match UnguidedDenoisingViTDecoder, so its weights load here with
+	only context_proj, cross_attn and norm_context missing (all start with no effect).
 	'''
-	def __init__(self,cnn_layers=3,vit_layers=1,channels=32,mlp_ratio=4,time_dim=256,context_dims=(128,256,512)):
-		super().__init__()	
+	def __init__(self,cnn_layers=3,vit_layers=1,channels=32,mlp_ratio=4,time_dim=256,context_dims=(32,64,128,256,512)):
+		super().__init__()
 		up_params = {'kernel_size': 4, 'stride': 2,'padding': 1, 'bias': True}
-		c3_dim,c4_dim,c5_dim = context_dims
+		c1_dim,c2_dim,c3_dim,c4_dim,c5_dim = context_dims
 
 		self.decoder_1 = ContextViTBlock(channels*16,num_heads=8,time_dim=time_dim,context_dim=c5_dim,mlp_ratio=mlp_ratio,depth=vit_layers)
 		self.up_1      = nn.ConvTranspose2d(channels*16,channels*8,**up_params)
@@ -625,21 +633,21 @@ class GuidedDenoisingViTDecoder(nn.Module):
 		self.up_3      = nn.ConvTranspose2d(channels*4,channels*2,**up_params)
 
 		self.ch_mix_4  = nn.Conv2d(channels*4,channels*2,1,bias=True)
-		self.decoder_4 = TimeConvBlock(channels*2,time_dim,depth=cnn_layers)
+		self.decoder_4 = ContextCNNBlock(channels*2,time_dim,c2_dim,depth=cnn_layers)
 		self.up_4      = nn.ConvTranspose2d(channels*2,channels,**up_params)
 
 		self.ch_mix_5  = nn.Conv2d(channels*2,channels,1,bias=True)
-		self.decoder_5 = TimeConvBlock(channels,time_dim,depth=cnn_layers)
+		self.decoder_5 = ContextCNNBlock(channels,time_dim,c1_dim,depth=cnn_layers)
 
 
 	def forward(self,x,skips,t_emb,context):
 		enc_1,enc_2,enc_3,enc_4 = skips
-		(_,_,c3,c4),c5 = context # BT ENCODER OUTPUT: ([c1,c2,c3,c4],c5)
+		(c1,c2,c3,c4),c5 = context # BT ENCODER OUTPUT: ([c1,c2,c3,c4],c5)
 		dec_1 = self.decoder_1(x,t_emb,c5)
 		dec_2 = self.decoder_2(self.ch_mix_2( torch.cat([enc_4,self.up_1(dec_1)],dim=1) ),t_emb,c4)
 		dec_3 = self.decoder_3(self.ch_mix_3( torch.cat([enc_3,self.up_2(dec_2)],dim=1) ),t_emb,c3)
-		dec_4 = self.decoder_4(self.ch_mix_4( torch.cat([enc_2,self.up_3(dec_3)],dim=1) ),t_emb)
-		dec_5 = self.decoder_5(self.ch_mix_5( torch.cat([enc_1,self.up_4(dec_4)],dim=1) ),t_emb)
+		dec_4 = self.decoder_4(self.ch_mix_4( torch.cat([enc_2,self.up_3(dec_3)],dim=1) ),t_emb,c2)
+		dec_5 = self.decoder_5(self.ch_mix_5( torch.cat([enc_1,self.up_4(dec_4)],dim=1) ),t_emb,c1)
 		return dec_5
 
 
