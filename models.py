@@ -147,7 +147,7 @@ class ViTBlock(nn.Module):
 	Wrapper for ViT layers for image-token-image conversion.
 	Takes inputs [B,C,H,W]. Returns [B,C,H,W]
 	'''
-	def __init__(self,E,num_heads,mlp_ratio=4,depth=1):
+	def __init__(self,E,num_heads,mlp_ratio=4,depth=2):
 		super().__init__()
 		self.block = nn.ModuleList([ViTLayer(E,num_heads,mlp_ratio) for _ in range(depth)])
 		# self.block = ViTLayer(E,num_heads,mlp_ratio) #single layer for now
@@ -445,6 +445,7 @@ class GuidedDenoisingCNNEncoder(nn.Module):
 		enc_5 = self.encoder_5(self.down_4(enc_4),t_emb,c5)
 		return [enc_1,enc_2,enc_3,enc_4], enc_5
 
+
 class GuidedDenoisingViTEncoder(nn.Module):
 	'''
 	Hybrid CNN/ViT without positional encoding. 2xCNN + 3xViT layers.
@@ -608,6 +609,7 @@ class GuidedDenoisingCNNDecoder(nn.Module):
 		dec_5 = self.decoder_5(self.ch_mix_5( torch.cat([enc_1,self.up_4(dec_4)],dim=1) ),t_emb,c1)
 		return dec_5
 
+
 class GuidedDenoisingViTDecoder(nn.Module):
 	'''
 	3-stage ViT & 2-stage CNN. Mirrors GuidedDenoisingViTEncoder: context at every
@@ -692,9 +694,10 @@ class ConditionCNNEncoder(nn.Module):
 class ConditionViTEncoder(nn.Module):
 	'''
 	Encoder for RGB inputs.
-	Hybrid ViT without positional encoding. 2xCNN + 3xViT layers
+	Hybrid ViT without positional encoding. 2xCNN + 3xViT stages, vit_layers ViT layers per ViT stage
+	(default 1 matches the bt_pretrain checkpoints).
 	'''
-	def __init__(self,channels=32,cnn_layers=2,mlp_ratio=4,in_channels=4):
+	def __init__(self,channels=32,cnn_layers=2,vit_layers=1,mlp_ratio=4,in_channels=4):
 		super().__init__()
 		down_params = {'kernel_size': 3, 'stride': 2, 'padding': 1, 'bias': True}
 
@@ -704,11 +707,11 @@ class ConditionViTEncoder(nn.Module):
 		self.down_1    = nn.Conv2d(channels,channels*2,**down_params)
 		self.encoder_2 = ConvBlock(channels*2,depth=cnn_layers)
 		self.down_2    = nn.Conv2d(channels*2,channels*4,**down_params)
-		self.encoder_3 = ViTBlock(channels*4,num_heads=2,mlp_ratio=mlp_ratio,depth=1)		
+		self.encoder_3 = ViTBlock(channels*4,num_heads=2,mlp_ratio=mlp_ratio,depth=vit_layers)		
 		self.down_3    = nn.Conv2d(channels*4,channels*8,**down_params)
-		self.encoder_4 = ViTBlock(channels*8,num_heads=4,mlp_ratio=mlp_ratio,depth=1)
+		self.encoder_4 = ViTBlock(channels*8,num_heads=4,mlp_ratio=mlp_ratio,depth=vit_layers)
 		self.down_4    = nn.Conv2d(channels*8,channels*16,**down_params)
-		self.encoder_5 = ViTBlock(channels*16,num_heads=8,mlp_ratio=mlp_ratio,depth=1)	
+		self.encoder_5 = ViTBlock(channels*16,num_heads=8,mlp_ratio=mlp_ratio,depth=vit_layers)	
 
 	def forward(self,x):
 		x = self.in_layer(x)
@@ -1014,21 +1017,33 @@ class BTSegmenter(nn.Module):
 		return self.decoder(x,skips)
 
 
-class BaseSegmenter(nn.Module): # TODO --- ADD CHANGEABLE ENCODER/DECODER
+class BaseSegmenter(nn.Module):
 	'''
-	Standard segmentation model supervised learning. Baseline.
+	Standard segmentation model for supervised learning, trained from scratch. Baseline.
+	encoder/decoder: 'cnn' (5 CNN stages) or 'vit' (2 CNN + 3 ViT stages, vit_layers ViT layers each).
 	'''
-	def __init__(self,channels=32,cnn_layers=2):
+	def __init__(self,model_id,encoder='cnn',decoder='cnn',init_chan=32,cnn_layers=2,vit_layers=1,mlp_ratio=4):
 		super().__init__()
-		self.encoder = ConditionCNNEncoder(channels=channels,cnn_layers=cnn_layers)
-		# self.encoder = ConditionViTEncoder(channels=channels,cnn_layers=cnn_layers)
-		self.decoder = BaseCNNSegDecoder(channels=channels,cnn_layers=cnn_layers)
-		# self.decoder = BaseViTSegDecoder(channels=channels,cnn_layers=cnn_layers)
+		self.model_name = "S2Base"
+		self.model_id   = model_id
+
+		# ENCODER
+		assert encoder in ["cnn","vit"], f"Unknown encoder '{encoder}'"
+		if encoder == 'cnn':
+			self.encoder = ConditionCNNEncoder(channels=init_chan,cnn_layers=cnn_layers)
+		if encoder == 'vit':
+			self.encoder = ConditionViTEncoder(channels=init_chan,cnn_layers=cnn_layers,vit_layers=vit_layers,mlp_ratio=mlp_ratio)
+
+		# DECODER
+		assert decoder in ["cnn","vit"], f"Unknown decoder '{decoder}'"
+		if decoder == 'cnn':
+			self.decoder = BaseCNNSegDecoder(channels=init_chan,cnn_layers=cnn_layers)
+		if decoder == 'vit':
+			self.decoder = BaseViTSegDecoder(channels=init_chan,cnn_layers=cnn_layers,vit_layers=vit_layers,mlp_ratio=mlp_ratio)
 
 	def forward(self,x):
 		skips, enc_out = self.encoder(x)
-		dec_out = self.decoder(enc_out,skips)
-		return dec_out
+		return self.decoder(enc_out,skips)
 
 
 ################################################################################

@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import time
+import math
 import argparse
 
 import dataloader
@@ -19,11 +20,6 @@ import models
 
 LOG_DIR   = None
 MODEL_DIR = None
-
-# FIXED PROBE SETTINGS -- SAME FOR EVERY BT CHECKPOINT SO PROBE SCORES ARE COMPARABLE
-# PROBE_LRATE  = 0.0002
-# PROBE_EPOCHS = 100
-# PROBE_BATCH  = 32
 
 def parse_args():
 	'''
@@ -37,8 +33,6 @@ def parse_args():
 	required.add_argument('--log-dir',required=True,help='Output dir for training logs.')
 	required.add_argument('--params',required=True,help='JSON hyperparameter file.')
 	required.add_argument('--id',required=True,type=int,help='model id in hyperparameter file.')
-	required.add_argument('--probe-only',action='store_true',help='If set, freeze encoder and fit decoder only.')
-
 
 	# OPTIONAL
 	optional = parser.add_argument_group('Optional arguments')
@@ -142,7 +136,7 @@ def validate(model,gpu_norm,dataloader,loss_fn,device):
 
 
 def train_and_validate(model,gpu_aug,gpu_norm,dataloaders,loss_fn,optimizer,scheduler,device,epochs=100):
-	logger = utils.SegmentationLogger(f'{LOG_DIR}/probe_{model.model_id:03}.tsv')
+	logger = utils.SegmentationLogger(f'{LOG_DIR}/base_{model.model_id:03}.tsv')
 	tracker = utils.RecentBestTracker(n=1)
 	best_iou = 0.0
 	best_epoch = 0
@@ -164,7 +158,7 @@ def train_and_validate(model,gpu_aug,gpu_norm,dataloaders,loss_fn,optimizer,sche
 		if (epoch+1)>10 and va_result['iou_1'] > best_iou:
 			best_iou = va_result['iou_1']
 			best_epoch = epoch
-			pth_path = utils.save_checkpoint(MODEL_DIR,model,optimizer,epoch,tag='probe')
+			pth_path = utils.save_checkpoint(MODEL_DIR,model,optimizer,epoch,tag='base')
 			tracker.update(pth_path)
 
 		# STDOUT LOG EPOCH TIME
@@ -179,6 +173,9 @@ def train_and_validate(model,gpu_aug,gpu_norm,dataloaders,loss_fn,optimizer,sche
 	print(f'Peak GPU memory allocated: {mem_gb:.2f} GB')
 
 	
+################################################################################
+# MAIN/SETUP
+################################################################################
 if __name__ == '__main__':
 
 	# PARSE ARGS/FILES, SET SEED
@@ -187,22 +184,51 @@ if __name__ == '__main__':
 	utils.set_seed(hp['seed'])
 	device = torch.device(f'cuda:{args.device}')
 
+	# CHECK HYPERPARAMETERS
+	lrate,decay,epochs,batch = hp['lrate'],hp['decay'],hp['epochs'],hp['batch']
+	assert hp['encoder'] in ['cnn','vit'], f"Unknown encoder {hp['encoder']}"
+	assert hp['decoder'] in ['cnn','vit'], f"Unknown decoder {hp['decoder']}"
+	assert lrate > 0 and decay >= 0, f"Got lrate {lrate}, decay {decay}"
+	assert epochs > 10, f"Got {epochs} epochs; 10 are warmup"
+	has_vit = 'vit' in (hp['encoder'],hp['decoder'])
+	assert (hp['vit_layers'] >= 1) if has_vit else (hp['vit_layers'] == 0), f"Got vit_layers {hp['vit_layers']} for {hp['encoder']}-{hp['decoder']}"
 
-	seg_net = model.BaseSegmenter()
+	# SEGMENTATION NETWORK
+	seg_net = models.BaseSegmenter(
+		hp['id'],
+		encoder=hp['encoder'],
+		decoder=hp['decoder'],
+		init_chan=hp['init_chan'],
+		cnn_layers=hp['cnn_layers'],
+		vit_layers=max(hp['vit_layers'],1), # IGNORED BY cnn-cnn
+		mlp_ratio=hp.get('mlp_ratio',4)
+	)
 	seg_net.to(device)
-	seg_net = torch.compile(seg_net)
+	print(f"{hp['encoder']}-{hp['decoder']} | init_chan {hp['init_chan']} | vit_layers {hp['vit_layers']} | batch {batch} | lrate {lrate} | decay {decay}")
+	print(f'Parameters: {models.get_model_parameter_size(seg_net):,}')
 
-	# LOSS AND OPTIMIZER -- ONLY TRAINABLE PARAMS
+	# NO DECAY ON NORM WEIGHTS AND BIASES (ndim < 2)
+	params = list(seg_net.parameters())
+	param_groups = [
+		{'params':[p for p in params if p.ndim >= 2],'weight_decay':decay},
+		{'params':[p for p in params if p.ndim < 2],'weight_decay':0.0}
+	]
+
+	# LOSS AND OPTIMIZER
 	loss_fn = nn.CrossEntropyLoss()
-	optimizer = torch.optim.Adam(param_groups,lr=hp['lrate'])
+	optimizer = torch.optim.AdamW(param_groups,lr=lrate)
 
-	# SCHEDULER -- COSINE ANNEALING W/O RESTARTS
+	# SCHEDULER -- 10-EPOCH LINEAR WARMUP + COSINE ANNEALING W/O RESTARTS, FLOOR AT lrate/cosine_steps
 	warmup_steps = 10
 	cosine_steps = epochs-warmup_steps
-	min_rate = lrate / cosine_steps
+	min_factor = 1.0 / cosine_steps
+	cosine_factor = lambda e: min_factor + (1.0-min_factor) * 0.5 * (1.0 + math.cos(math.pi * min(e,cosine_steps) / cosine_steps))
 	warmup_sched = torch.optim.lr_scheduler.LinearLR(optimizer,start_factor=1e-2,end_factor=1.0,total_iters=warmup_steps)
-	cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=cosine_steps,eta_min=min_rate)
+	cosine_sched = torch.optim.lr_scheduler.LambdaLR(optimizer,lr_lambda=cosine_factor)
 	scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer,schedulers=[warmup_sched,cosine_sched],milestones=[warmup_steps])
+
+	# COMPILE AFTER BUILDING THE OPTIMIZER; save_checkpoint UNWRAPS _orig_mod
+	seg_net = torch.compile(seg_net)
 
 	# LOAD DATASET TO RAM
 	bands_tr,masks_tr = dataloader.load_cached_split(args.data_dir,split='training')
@@ -218,7 +244,7 @@ if __name__ == '__main__':
 		batch_size=batch,
 		num_workers=args.num_workers,
 		pin_memory=True,
-		prefetch_factor=8,
+		prefetch_factor=6,
 		persistent_workers=True
 	)
 
@@ -229,7 +255,9 @@ if __name__ == '__main__':
 		batch_size=batch,
 		num_workers=args.num_workers,
 		pin_memory=True,
-		prefetch_factor=8,
+		prefetch_factor=6,
 		persistent_workers=True
 	)
 	dataloaders = {'training':dloader_tr,'validation':dloader_va}
+
+	train_and_validate(seg_net,gpu_aug,gpu_norm,dataloaders,loss_fn,optimizer,scheduler,device,epochs=epochs)
