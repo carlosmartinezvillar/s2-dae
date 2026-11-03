@@ -8,11 +8,56 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 import time
 import argparse
-import json
-import inspect
+# import json
+# import inspect
 
-from model import S2SegDiff
+import dataloader
+import utils
+from models
 from diffusion import GaussianDiffusion, mask_to_x0, x0_to_mask, mask_channels
+
+
+def parse_args():
+	'''
+	Load args.
+	'''
+	# DEFINITION
+	parser = argparse.ArgumentParser()
+	required = parser.add_argument_group('Required arguments')
+	required.add_argument('--data-dir',required=True,help='Cache directory with training/ and validation/ built by fast_dataloader.py.')
+	required.add_argument('--net-dir',required=True,help='Output dir for trained model weights.')
+	required.add_argument('--log-dir',required=True,help='Output dir for training logs.')
+	required.add_argument('--params',required=True,help='JSON hyperparameter file.')
+	required.add_argument('--id',required=True,type=int,help='model id in hyperparameter file.')
+
+	# OPTIONAL
+	optional = parser.add_argument_group('Optional arguments')
+	optional.add_argument('--workers',required=False,type=int,default=4,help='Set num_workers args.')
+	optional.add_argument('--device',required=False,type=int,default=0,help='Override default GPU 0')
+
+	# LOAD
+	args = parser.parse_args ()
+
+	# CHECK REQUIRED
+	assert os.path.isdir(args.data_dir), f"No path found for data dir in {args.data_dir}"
+	assert os.path.isdir(args.net_dir), f"No path found for checkpoint dir in {args.net_dir}"
+	assert os.path.isdir(args.log_dir), f"No path found for log dir {args.log_dir}"
+	assert os.path.isfile(args.params), f"No hyperparameter found in {args.params}"
+
+	# CHECK OPTIONAL
+	assert args.device >= 0, f"Got negative arg for GPU id {args.gpu}"
+	if args.device > 0:
+		assert args.device < torch.cuda.device_count(), "GPU INDEX OUT OF RANGE."	
+	# assert args.workers in range(0,9), "Got out of range arg for nr of workers"
+
+	# SET GLOBAL VARS -- skip passing as args in train_probe(), train_whole(), etc.
+	global LOG_DIR
+	global MODEL_DIR
+	LOG_DIR = args.log_dir
+	MODEL_DIR = args.net_dir
+
+	# RETURN
+	return args
 
 
 def load_checkpoint(model,path):
@@ -35,54 +80,18 @@ def calculate_cross_entropy(x0_pred, true_mask, eps=1e-6):
 	return F.cross_entropy(torch.log(probs), true_mask.long())
 
 
-def parse_args():
-	'''
-	Load args.
-	'''
-	# DEFINITION
-	parser = argparse.ArgumentParser()
-	required = parser.add_argument_group('Required arguments')
-	required.add_argument('--data-dir',required=True,help='Cache directory with training/ and validation/ built by fast_dataloader.py.')
-	required.add_argument('--net-dir',required=True,help='Output dir for trained model weights.')
-	required.add_argument('--log-dir',required=True,help='Output dir for training logs.')
-	required.add_argument('-p','--params',required=True,help='JSON hyperparameter file.')
-	required.add_argument('--id',required=True,type=int,help='model id in hyperparameter file.')
-
-	# OPTIONAL
-	optional = parser.add_argument_group('Optional arguments')
-	optional.add_argument('--workers',required=False,type=int,default=4,help='Set num_workers args.')
-	optional.add_argument('--gpu',required=False,type=int,default=0,help='Override default GPU 0')
-
-	# LOAD
-	args = parser.parse_args ()
-
-	# CHECK REQUIRED
-	assert os.path.isdir(args.data_dir), f"No path found for data dir in {args.data_dir}"
-	assert os.path.isdir(args.net_dir), f"No path found for checkpoint dir in {args.net_dir}"
-	assert os.path.isdir(args.log_dir), f"No path found for log dir {args.log_dir}"
-	assert os.path.isfile(args.params), f"No hyperparameter found in {args.params}"
-
-	# CHECK OPTIONAL
-	assert args.gpu >= 0, f"Got negative arg for GPU id {args.gpu}"
-	if args.gpu > 0:
-		assert args.gpu < torch.cuda.device_count(), "GPU INDEX OUT OF RANGE."	
-	# assert args.workers in range(0,9), "Got out of range arg for nr of workers"
-
-	# RETURN
-	return args
-
-
 def train(model,gpu_aug,diffusion,loader,optimizer,scheduler,device):
 
-	loss_sum = torch.zeros(1,device=device)
-	samp_sum = torch.zeros(1,device=device)
 	model.train()
+
+	loss_sum  = torch.zeros(1,device=device)
+	n_samples = torch.zeros(1,device=device)
 
 	for vnir,mask in loader:
 
 		vnir = vnir.to(device,non_blocking=True)
 		mask = mask.to(device,non_blocking=True)
-		vnir = gpu_aug(vnir)
+		vnir,mask = gpu_aug(vnir,mask)
 
 		x0  = mask_to_x0(mask,2)
 		t   = torch.randint(0,diffusion.timesteps,(vnir.shape[0],),device=device,dtype=torch.long)
@@ -96,215 +105,249 @@ def train(model,gpu_aug,diffusion,loader,optimizer,scheduler,device):
 		optimizer.step()
 
 
-		loss_sum += loss.detach() * vnir.size(0)
-		samp_sum += vnir.size(0)
+		loss_sum  += loss.detach() * vnir.size(0)
+		n_samples += vnir.size(0)
 
 	scheduler.step()
 
-	return (loss_sum/samp_sum).item() # >>>> CPU-GPU SYNC <<<<
+	return (loss_sum/n_samples).item() # >>>> CPU-GPU SYNC <<<<
 
 
 @torch.no_grad()
-def validate(model,diffusion,loader,device,normalize):
+def validate(model,gpu_norm,diffusion,loader,device):
 	'''
 	Noise-prediction (MSE) loss over the full validation set.
 	'''
+
 	model.eval()
+
 	mse_loss_sum = torch.zeros(1,device=device)
-	samp_sum     = torch.zeros(1,device=device)
+	n_samples    = torch.zeros(1,device=device)
 
-	for vnir,lbl in loader:
+	for vnir,mask in loader:
 
-		vnir = normalize(vnir.to(device,non_blocking=True))
-		lbl = lbl.to(device,non_blocking=True)
+		vnir = vnir.to(device,non_blocking=True)
+		mask = mask.to(device,non_blocking=True)
+		vnir,mask = gpu_norm(vnir,mask)
 
-		x0 = mask_to_x0(lbl,n_classes)
+		x0 = mask_to_x0(mask,n_classes)
 		t  = torch.randint(0,diffusion.timesteps,(vnir.shape[0],),device=device,dtype=torch.long)
 
 		with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
 			mse_loss = diffusion.p_loss(x0,vnir,t)
-		mse_loss_sum += mse_loss.detach() * vnir.size(0)
-		samp_sum     += vnir.size(0)
 
-	return (mse_loss_sum/samp_sum).item()
+		mse_loss_sum += mse_loss.detach() * vnir.size(0)
+		n_samples    += vnir.size(0)
+
+	return (mse_loss_sum/n_samples).item()
 
 
 @torch.no_grad()
-def validate_sampling(model,diffusion,loader,device,normalize,n_classes=2,seed=0):
+def validate_with_sampling(model,gpu_norm,diffusion,dataloader,device,n_classes=2,seed=0):
 	'''
 	Segmentation metrics from DDIM-sampled masks, on a fixed subset of the validation set.
 	The sampling noise uses a fixed seed on a forked RNG, so every evaluation sees the
 	same noise (comparable across epochs/runs) and the training RNG stream is untouched.
 	'''
 	model.eval()
+
 	ce_loss_sum = torch.zeros(1,device=device)
-	samp_sum    = torch.zeros(1,device=device)
+	n_samples   = torch.zeros(1,device=device)
 	gpu_cmat    = torch.zeros((n_classes,n_classes),device=device,dtype=torch.int64)
 
 	with torch.random.fork_rng(devices=[device] if device.type == 'cuda' else []):
 		torch.manual_seed(seed)
 
-		for vnir,lbl in loader:
+		for vnir,mask in dataloader:
 
-			vnir = normalize(vnir.to(device,non_blocking=True))
-			lbl = lbl.to(device,non_blocking=True)
+			vnir = vnir.to(device,non_blocking=True)
+			mask = mask.to(device,non_blocking=True)			
+			vnir,mask = gpu_norm(vnir,mask)
+			
+			mask = mask.to(device,non_blocking=True)
 
 			with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
 				# x0_pred = diffusion.p_sample_loop(vnir,mask_channels=mask_channels(n_classes))
 				x0_pred = diffusion.ddim_sample_loop(vnir,mask_channels=mask_channels(n_classes))
 			pred_mask = x0_to_mask(x0_pred)
+
 			ce_loss_sum += calculate_cross_entropy(x0_pred.float(),lbl) * vnir.size(0)
-			samp_sum    += vnir.size(0)
-			update_confusion_matrix(gpu_cmat,lbl,pred_mask,n_classes)
+			n_samples   += vnir.size(0)
 
-	return (ce_loss_sum/samp_sum).item(), gpu_cmat.cpu()
+			utils.update_confusion_matrix(gpu_cmat,mask,pred_mask,n_classes)
+
+	# CPU-GPU SYNC
+	closs    = (ce_loss_sum/n_samples).item() 
+	cpu_cmat = gpu_cmat.cpu()
+
+	result = utils.calculate_seg_metrics(cpu_cmat)
+	flat_result = {f"{k}_{i}":result[k][i].item() for k in result.keys() for i in range(2)}
+	flat_result.update({'closs': closs})
+
+	return
 
 
-def train_and_validate(args):
-
-	device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
-	hp = load_hyperparameters(args)
-
-	if hp.get('seed',0) != 0:
-		set_seed(hp['seed'])
-
-	n_classes = hp['labels']
-	model = S2SegDiff(model_id=hp['id'],mask_channels=mask_channels(n_classes),in_channels=hp['bands'],cnn_layers=hp['cnn_layers'],
-						vit_layers=hp['vit_layers'],channels=hp['channels'],mlp_ratio=hp['mlp_ratio'])
-	model = model.to(device)
-	model = torch.compile(model,mode='reduce-overhead') # CUDA graphs: fewer kernel launches per forward
-
-	# WEIGHT DECAY ONLY ON WEIGHT MATRICES/KERNELS -- NOT ON NORMS AND BIASES
-	decay_params    = [p for p in model.parameters() if p.ndim >= 2]
-	no_decay_params = [p for p in model.parameters() if p.ndim < 2]
-	optimizer = torch.optim.AdamW([
-		{'params':decay_params,'weight_decay':hp['decay']},
-		{'params':no_decay_params,'weight_decay':0.0}],
-		lr=hp['lrate'],
-		fused=device.type == 'cuda') # single fused kernel for the whole update
-
-	# DATASETS
-	# uint8 CHIPS FROM THE .npy CACHE; NORMALIZATION (AND TRAINING NOISE) ON THE GPU
-	train_dataset = FastSentinelDataset(f"{args.data_dir}/training",transform=None) # transform=FastTrainTransform() to augment
-	valid_dataset = FastSentinelDataset(f"{args.data_dir}/validation",transform=None)
-	for ds in (train_dataset,valid_dataset):
-		assert ds.n_bands == hp['bands'] and ds.n_labels == n_classes, \
-			f"Cache {ds.cache_dir} has bands={ds.n_bands}, labels={ds.n_labels}; hyperparameters need bands={hp['bands']}, labels={n_classes}"
-
-	normalize = GPUNormalize(train_dataset.mean,train_dataset.std,device)
-	noise     = None # GPUGaussianNoise() to augment (use together with FastTrainTransform)
-
-	# DATALOADERS
-	loader_kwargs = {
-		'num_workers':args.workers,
-		'pin_memory':True,
-		'persistent_workers':args.workers > 0,
-		'prefetch_factor':4 if args.workers > 0 else None}
-
-	train_dloader = DataLoader(
-		train_dataset,
-		batch_size=hp['batch'],
-		drop_last=True, # no smaller last batch -> no recompile/extra CUDA graph
-		shuffle=True,
-		**loader_kwargs)
-
-	valid_dloader = DataLoader(
-		valid_dataset,
-		batch_size=hp['batch'],
-		drop_last=False,
-		shuffle=False,
-		**loader_kwargs)
-
-	# FIXED SUBSET FOR DDIM-SAMPLED METRICS: 512 CHIPS EVENLY SPACED OVER THE (SORTED) VALIDATION SET
-	sample_idx = np.unique(np.linspace(0,len(valid_dataset)-1,min(512,len(valid_dataset)),dtype=int))
-	sample_dloader = DataLoader(
-		Subset(valid_dataset,sample_idx.tolist()),
-		batch_size=2*hp['batch'], # no gradients -> room for larger batches, fewer sequential DDIM calls
-		drop_last=False,
-		shuffle=False,
-		**loader_kwargs)
-
-	# LRATE SCHEDULER -- LINEAR WARMUP OVER 5 EPOCHS (STEPPED PER BATCH), THEN CONSTANT LR
-	# warmup_steps = 5*len(train_dloader)
-	# scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step: min(1.0,(step+1)/warmup_steps))
-	# LINEAR WARMUP OVER 1000 OPTIMIZER STEPS, THEN CONSTANT LR
-	# scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step: min(1.0,(step+1)/1000))
-	# COMBINED SCHEDULER
-	warmup_steps = 5
-	cosine_steps = (hp['epochs'] - warmup_steps) // 1
-	warmup_sched = torch.optim.lr_scheduler.LinearLR(
-		optimizer,
-		start_factor=1e-2,
-		end_factor=1.0,
-		total_iters=warmup_steps
-	)
-	cosine_sched = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-		optimizer,
-		T_0=cosine_steps,
-		T_mult=1,
-		eta_min=0.0)
-	scheduler = torch.optim.lr_scheduler.SequentialLR(
-		optimizer,
-		schedulers=[warmup_sched,cosine_sched],
-		milestones=[warmup_steps]
-	)
+def train_and_validate(model,gpu_aug,gpu_norm,dataloaders,optimizer,scheduler,diffusion,device,epochs=100):
  
-	# FORWARD + REVERSE DIFFUSION
-	diffusion = GaussianDiffusion(model,timesteps=1000,ddim_steps=100,device=device)
-
 	# LOG PATHS/BUFFERS
-	log_file_path = f'{args.log_dir}/epochs_{model.model_id:03}.tsv'
-	logger        = Logger(log_file_path,n_classes=n_classes)
+	logger  = utils.DiffLogger(f'{LOG_DIR}/base_{model.model_id:03}.tsv')
+	tracker = utils.RecentBestTracker(n=3) 
 	best_iou = 0.0
 	best_iou_epoch = 0
 	# best_dice = 0.0
 	# best_dice_epoch = 0
-	recent_best = RecentBestTracker(n=2)
 
+	total_time_t0 = time.perf_counter()
 
-	for epoch in range(hp['epochs']):
+	for epoch in range(epochs):
+		print(f'--- EPOCH {epoch:04} ---')
 
-		# TRAIN & VALIDATE
+		# TRAIN
 		start_time = time.perf_counter()
-		train_loss = train(model,diffusion,train_dloader,optimizer,scheduler,device,normalize,noise=noise,n_classes=n_classes)
-		print(f"Epoch {epoch}: train_loss={train_loss:.5f}")
-		valid_loss = validate(model,diffusion,valid_dloader,device,normalize,n_classes=n_classes)
-		print(f"Epoch {epoch}: valid_loss={valid_loss:.5f}")
+		train_loss = train(model,gpu_aug,diffusion,dataloaders['training'],optimizer,scheduler,device)
+		print(f"train loss (MSE): {train_loss:.5f}")
+
+		# VALIDATE
+		valid_loss = validate(model,gpu_norm,diffusion,dataloaders['validation'],device)
+		print(f"valid loss (MSE): {valid_loss:.5f}")
 		train_time = time.perf_counter() - start_time
+
 		print(f"Train+validation time: {train_time:.2f} secs.")
 
 		# SAMPLED SEGMENTATION METRICS (SUBSET) -- USE THESE FOR MODEL SELECTION
 		sample_metrics = (epoch+1) % 5 == 0
+
 		if sample_metrics:
-			sampling_start_time = time.perf_counter()
-			ce_loss,valid_cmat = validate_sampling(model,diffusion,sample_dloader,device,normalize,n_classes=n_classes)
-			sampling_time = time.perf_counter() - sampling_start_time
-			va_metrics = calculate_metrics(valid_cmat)
+			sampling_time_t0 = time.perf_counter()
+			ce_result = validate_with_sampling(model,gpu_norm,diffusion,sample_dloader,device,normalize,n_classes=2)
+			sampling_time_t1 = time.perf_counter()
 		else:
-			ce_loss    = float('nan')
-			va_metrics = {k:torch.full((n_classes,),float('nan')) for k in ('ppv','tpr','acc','iou','dice')}
+			ce_loss   = float('nan')
+			ce_result = {k:torch.full((2,),float('nan')) for k in ('ppv','tpr','acc','iou','dice')}
 
 		# COLLECT METRICS & RESULTS
 		results = {'tloss':train_loss,'vloss':valid_loss,'closs':ce_loss}
-		results.update(va_metrics)
+		results.update(ce_result)
+
 		if sample_metrics:
-			print(f"CE: {results['closs']:.5f} | IoU: {results['iou'][1]:.5f} | Dice: {results['dice'][1]:.5f}")
-			print(f"Sampling time: {sampling_time:.2f} secs.")
+			print(f"CE: {results['closs']:.5f} | IoU: {results['iou_1']:.5f} | Dice: {results['dice_1']:.5f}")
+			print(f"Sampling time: {sampling_time_t1-sampling_time_t0:.2f} secs.")
 
 		# LOG WHOLE EPOCH
 		logger.log(results)
 
 		# SAVE CHECKPOINTS
 		if sample_metrics:
-			if best_iou < results['iou'][1]:
-				best_iou = results['iou'][1]
-				chkpt_path = save_checkpoint(args.net_dir,model,optimizer,epoch,'best')
-				recent_best.update(chkpt_path)
+			if best_iou < results['iou_1']:
+				best_iou = results['iou_1']
+				best_iou_epoch = epoch
+				pth_path = save_checkpoint(MODEL_DIR,model,optimizer,epoch,tag='full')
+				recent_best.update(pth_path)
 
-		print('-'*60)
-
+	# STDOUT LOG OVERALL
+	total_time_t1 = time.perf_counter()
+	mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+	print(f'Total time: {(total_time_t1-total_time_t0)/60:.1f} min')
+	print(f'Best epoch: {best_epoch} | IoU: {best_iou:.5f}')
+	print(f'Peak GPU memory allocated: {mem_gb:.2f} GB')
 
 if __name__ == '__main__':
 
 	args = parse_args()
-	train_and_validate(args)
+	hp   = utils.load_hyperparameters(args)
+	utils.set_seed(hp['seed'])
+	# if hp.get('seed',0) != 0:
+		# set_seed(hp['seed'])
+	device = torch.device(f'cuda:{args.device}')
+
+
+	# CHECK HYPERPARAMETERS
+	lrate,decay,epochs,batch = hp['lrate'],hp['decay'],hp['epochs'],hp['batch']
+	assert hp['encoder'] in ['cnn','vit'], f"Unknown encoder {hp['encoder']}"
+	assert hp['decoder'] in ['cnn','vit'], f"Unknown decoder {hp['decoder']}"
+	assert lrate > 0 and decay >= 0, f"Got lrate {lrate}, decay {decay}"
+	assert epochs > 10, f"Got {epochs} epochs; 10 are warmup"
+	has_vit = 'vit' in (hp['encoder'],hp['decoder'])
+	assert (hp['vit_layers'] >= 1) if has_vit else (hp['vit_layers'] == 0), f"Got vit_layers {hp['vit_layers']} for {hp['encoder']}-{hp['decoder']}"
+
+	n_classes = hp['labels']
+	seg_net = models.S2SegDiff(
+		model_id=hp['id'],
+		mask_channels=mask_channels(n_classes),
+		in_channels=hp['bands'],
+		cnn_layers=hp['cnn_layers'],
+		vit_layers=hp['vit_layers'],
+		channels=hp['channels'],
+		mlp_ratio=hp['mlp_ratio']
+	)
+	seg_net = seg_net.to(device)
+
+
+	# NO DECAY ON NORM WEIGHTS AND BIASES (ndim < 2)
+	params = list(seg_net.parameters())
+	param_groups = [
+		{'params':[p for p in params if p.ndim >= 2],'weight_decay':decay},
+		{'params':[p for p in params if p.ndim < 2],'weight_decay':0.0}
+	]
+	optimizer = torch.optim.AdamW(param_groups,lr=lrate,fused=device.type == 'cuda') # single fused kernel for the whole update?
+
+
+	# SCHEDULER -- 10-EPOCH LINEAR WARMUP + COSINE ANNEALING W/O RESTARTS, FLOOR AT lrate/cosine_steps
+	warmup_steps = 10
+	cosine_steps = epochs-warmup_steps
+	min_factor = 1.0 / cosine_steps
+	cosine_factor = lambda e: min_factor + (1.0-min_factor) * 0.5 * (1.0 + math.cos(math.pi * min(e,cosine_steps) / cosine_steps))
+	warmup_sched = torch.optim.lr_scheduler.LinearLR(optimizer,start_factor=1e-2,end_factor=1.0,total_iters=warmup_steps)
+	cosine_sched = torch.optim.lr_scheduler.LambdaLR(optimizer,lr_lambda=cosine_factor)
+	scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer,schedulers=[warmup_sched,cosine_sched],milestones=[warmup_steps])
+
+	# COMPILE AFTER BUILDING THE OPTIMIZER; save_checkpoint UNWRAPS _orig_mod
+	seg_net = torch.compile(seg_net,mode='reduce-overhead') # CUDA graphs: fewer kernel launches per forward
+
+	# LOAD DATASET TO RAM
+	bands_tr,masks_tr = dataloader.load_cached_split(args.data_dir,split='training')
+	bands_va,masks_va = dataloader.load_cached_split(args.data_dir,split='validation')
+	dset_tr = dataloader.SentinelFastDataset(bands_tr,masks_tr)
+	dset_va = dataloader.SentinelFastDataset(bands_va,masks_va)
+
+	gpu_aug  = dataloader.GPULabeledTransform().to(device) #supervised augmentations
+	gpu_norm = dataloader.GPUValidationTransform().to(device)
+	# noise     = None # GPUGaussianNoise() to augment (use together with FastTrainTransform)
+
+	# DATALOADERS
+	dloader_tr = DataLoader(
+		dataset=dset_tr,
+		shuffle=True,
+		drop_last=True,
+		batch_size=batch,
+		num_workers=args.num_workers,
+		pin_memory=True,
+		prefetch_factor=6,
+		persistent_workers=True
+	)
+
+	dloader_va = DataLoader(
+		dataset=dset_va,
+		shuffle=False,
+		drop_last=False,
+		batch_size=batch,
+		num_workers=args.num_workers,
+		pin_memory=True,
+		prefetch_factor=6,
+		persistent_workers=True
+	)
+	dataloaders = {'training':dloader_tr,'validation':dloader_va}
+
+	# FIXED SUBSET FOR DDIM-SAMPLED METRICS: 512 CHIPS EVENLY SPACED OVER THE (SORTED) VALIDATION SET
+	sample_idx = np.unique(np.linspace(0,len(dset_va)-1,min(512,len(dset_va)),dtype=int))
+	sample_dloader = DataLoader(
+		Subset(dset_va,sample_idx.tolist()),
+		batch_size=2*hp['batch'], # no gradients -> room for larger batches, fewer sequential DDIM calls
+		drop_last=False,
+		shuffle=False,
+		**loader_kwargs)
+
+	# FORWARD + REVERSE DIFFUSION
+	diffusion = GaussianDiffusion(seg_net,timesteps=1000,ddim_steps=100,device=device)
+
+	train_and_validate(model,gpu_aug,gpu_norm,dataloaders,optimizer,scheduler,diffusion,device,epochs=100)
