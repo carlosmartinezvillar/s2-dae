@@ -60,7 +60,11 @@ def parse_args():
 	return args
 
 
-def load_checkpoint(model,path):
+def load_encoder_checkpoint(hp,epoch=None):
+	pass
+
+
+def load_denoiser_checkpoint(hp,epoch=None):
 	pass
 
 
@@ -271,7 +275,7 @@ if __name__ == '__main__':
 	assert (hp['vit_layers'] >= 1) if has_vit else (hp['vit_layers'] == 0), f"Got vit_layers {hp['vit_layers']} for {hp['encoder']}-{hp['decoder']}"
 
 	n_classes = hp['labels']
-	seg_net = models.S2SegDiff(
+	seg_net = models.ConditionedDenoiser(
 		model_id=hp['id'],
 		mask_channels=mask_channels(n_classes),
 		in_channels=hp['bands'],
