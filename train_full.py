@@ -83,7 +83,9 @@ def calculate_cross_entropy(x0_pred, true_mask, eps=1e-6):
 	probs = ((x0_pred + 1) / 2).clamp(min=eps)
 	return F.cross_entropy(torch.log(probs), true_mask.long())
 
-
+################################################################################
+# TRAIN/VALIDATE
+################################################################################
 def train(model,gpu_aug,diffusion,loader,optimizer,scheduler,device):
 
 	model.train()
@@ -101,7 +103,7 @@ def train(model,gpu_aug,diffusion,loader,optimizer,scheduler,device):
 		t   = torch.randint(0,diffusion.timesteps,(vnir.shape[0],),device=device,dtype=torch.long)
 
 		with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
-			loss = diffusion.p_loss(x0,vnir,t)
+			loss = diffusion.p_loss(x0,t,vnir)
 
 		optimizer.zero_grad()
 		loss.backward()
@@ -138,14 +140,16 @@ def validate(model,gpu_norm,diffusion,loader,device):
 		t  = torch.randint(0,diffusion.timesteps,(vnir.shape[0],),device=device,dtype=torch.long)
 
 		with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
-			mse_loss = diffusion.p_loss(x0,vnir,t)
+			mse_loss = diffusion.p_loss(x0,t,vnir)
 
 		mse_loss_sum += mse_loss.detach() * vnir.size(0)
 		n_samples    += vnir.size(0)
 
 	return (mse_loss_sum/n_samples).item()
 
-
+################################################################################
+# SAMPLE & SCORE/VALIDATE
+################################################################################
 @torch.no_grad()
 def validate_with_sampling(model,gpu_norm,diffusion,dataloader,device,n_classes=2,seed=0):
 	'''
@@ -171,8 +175,8 @@ def validate_with_sampling(model,gpu_norm,diffusion,dataloader,device,n_classes=
 			mask = mask.to(device,non_blocking=True)
 
 			with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
-				# x0_pred = diffusion.p_sample_loop(vnir,mask_channels=mask_channels(n_classes))
-				x0_pred = diffusion.ddim_sample_loop(vnir,mask_channels=mask_channels(n_classes))
+				# x0_pred = diffusion.p_sample_loop(mask_to_x0(mask,n_classes),vnir)
+				x0_pred = diffusion.ddim_sample_loop(mask_to_x0(mask,n_classes),vnir) # MASK ONLY SETS THE SHAPE OF x_T
 			pred_mask = x0_to_mask(x0_pred)
 
 			ce_loss_sum += calculate_cross_entropy(x0_pred.float(),lbl) * vnir.size(0)
@@ -190,7 +194,9 @@ def validate_with_sampling(model,gpu_norm,diffusion,dataloader,device,n_classes=
 
 	return
 
-
+################################################################################
+# RUN
+################################################################################
 def train_and_validate(model,gpu_aug,gpu_norm,dataloaders,optimizer,scheduler,diffusion,device,epochs=100):
  
 	# LOG PATHS/BUFFERS
@@ -255,6 +261,10 @@ def train_and_validate(model,gpu_aug,gpu_norm,dataloaders,optimizer,scheduler,di
 	print(f'Best epoch: {best_epoch} | IoU: {best_iou:.5f}')
 	print(f'Peak GPU memory allocated: {mem_gb:.2f} GB')
 
+
+################################################################################
+# MAIN/SETUP
+################################################################################
 if __name__ == '__main__':
 
 	args = parse_args()

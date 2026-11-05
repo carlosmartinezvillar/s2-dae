@@ -1,18 +1,28 @@
+'''
+Pretrain an unguided denoiser (models.UnconditionedDenoiser) on the 4 VNIR bands.
+The model learns to predict the noise added to normalized bands at a random step t.
+Its weights later initialize the diffusion segmentation model (diff_train).
+
+UNGUIDED: GaussianDiffusion(...,guided=False), LOSS diffusion.p_loss(x0,t).
+'''
+
 import os
 import math
-import random
-import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import time
 import argparse
-# import inspect
 
+import dataloader
+import utils
 import models
-from diffusion import GaussianDiffusion, mask_to_x0, x0_to_mask, mask_channels
+from diffusion import GaussianDiffusion
 
+LOG_DIR   = None
+MODEL_DIR = None
+
+# FIXED VALIDATION RNG -- SAME t AND NOISE EVERY EPOCH, SO VALIDATION MSE IS COMPARABLE ACROSS EPOCHS
+VAL_SEED = 0
 
 def parse_args():
 	'''
@@ -21,7 +31,7 @@ def parse_args():
 	# DEFINITION
 	parser = argparse.ArgumentParser()
 	required = parser.add_argument_group('Required arguments')
-	required.add_argument('--data-dir',required=True,help='Cache directory with training/ and validation/ built by fast_dataloader.py.')
+	required.add_argument('--data-dir',required=True,help='Directory of .npy cached datasets')
 	required.add_argument('--net-dir',required=True,help='Output dir for trained model weights.')
 	required.add_argument('--log-dir',required=True,help='Output dir for training logs.')
 	required.add_argument('--params',required=True,help='JSON hyperparameter file.')
@@ -29,11 +39,11 @@ def parse_args():
 
 	# OPTIONAL
 	optional = parser.add_argument_group('Optional arguments')
-	optional.add_argument('--workers',required=False,type=int,default=4,help='Set num_workers args.')
-	optional.add_argument('--device',required=False,type=int,default=0,help='Override default GPU 0')
+	optional.add_argument('--num-workers',required=False,type=int,default=4,help='Set num_workers args.')
+	optional.add_argument('--device',required=False,type=int,default=0,help='Override default GPU id 0')
 
 	# LOAD
-	args = parser.parse_args ()
+	args = parser.parse_args()
 
 	# CHECK REQUIRED
 	assert os.path.isdir(args.data_dir), f"No path found for data dir in {args.data_dir}"
@@ -42,12 +52,11 @@ def parse_args():
 	assert os.path.isfile(args.params), f"No hyperparameter found in {args.params}"
 
 	# CHECK OPTIONAL
-	assert args.device >= 0, f"Got negative arg for GPU id {args.gpu}"
+	assert args.device >= 0, f"Got negative arg for GPU id {args.device}"
 	if args.device > 0:
-		assert args.device < torch.cuda.device_count(), "GPU INDEX OUT OF RANGE."	
-	# assert args.workers in range(0,9), "Got out of range arg for nr of workers"
+		assert args.device < torch.cuda.device_count(), "GPU INDEX OUT OF RANGE."
 
-	# SET GLOBAL VARS -- skip passing as args in train_probe(), train_whole(), etc.
+	# SET GLOBAL VARS -- skip passing as args in train_and_validate()
 	global LOG_DIR
 	global MODEL_DIR
 	LOG_DIR = args.log_dir
@@ -59,126 +68,184 @@ def parse_args():
 
 def calculate_fid(dataloader,encoder):
 	'''
-	Calculate FID in VRAM.
+	Calculate FID in VRAM. TODO
 	'''
 	pass
 
 
 def calculate_lpips(dataloader,encoder):
 	'''
-	Calculate intraset paired LPIPS in VRAM.
+	Calculate intraset paired LPIPS in VRAM. TODO
 	'''
 	pass
 
 
 def validation_set_statistics(dataloader,encoder):
 	'''
-	Calculate feature mu and sigma of the entire validation set used by FID metric.
+	Calculate feature mu and sigma of the entire validation set used by FID metric. TODO
 	'''
 	pass
 
 
 def train(model,gpu_aug,diffusion,loader,optimizer,scheduler,device):
 	'''
-	Train unguided model on VNIR bands.
+	Train unguided model on VNIR bands. Noise-prediction (MSE) loss.
 	'''
+	model.train()
 
 	loss_sum  = torch.zeros(1,device=device)
 	n_samples = torch.zeros(1,device=device)
 
-	model.train()
-
 	for vnir,mask in loader:
 
-		# TO DEV & NORM
+		# TO GPU, AUGMENT & NORMALIZE -- THE MASK IS NOT USED
 		vnir = vnir.to(device,non_blocking=True)
-		mask = mask.to(device,non_blocking=True) #-- not needed
-		vnir,_ = gpu_aug(vnir,mask)
-
-		# GET X0 & RANDOM TIMESTEPS
-		# x0 = mask_to_x0(mask,2)
-
-		# ADJUST VNIR
+		mask = mask.to(device,non_blocking=True)
+		x0,_ = gpu_aug(vnir,mask) # NORMALIZED BANDS ARE x0
 
 		# RANDOM TIMESTEPS
-		t  = torch.randint(0,diffusion.timesteps,(vnir.shape[0],),device=device,dtype=torch.long)
+		t = torch.randint(0,diffusion.timesteps,(x0.shape[0],),device=device,dtype=torch.long)
 
-		# GET NOISY VNIR
-
-		# FORWARD
+		# FORWARD -- NOISE x0 TO x_t, PREDICT THE NOISE
 		with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
-			loss = diffusion.p_loss(x0,vnir,t) # ADJUST TO UNCONDITIONED
+			loss = diffusion.p_loss(x0,t)
 
 		# BACKPROP
 		optimizer.zero_grad()
 		loss.backward()
 		torch.nn.utils.clip_grad_norm_(model.parameters(),max_norm=1.0)
-		optimizer.step()		
+		optimizer.step()
 
-		loss_sum += loss.detach() * vnir.size(0)
-		n_samples += vnir.size(0)
+		# LOSS IS A BATCH MEAN -- WEIGHT BY BATCH SIZE FOR A PER-SAMPLE MEAN
+		loss_sum  += loss.detach() * x0.size(0)
+		n_samples += x0.size(0)
 
 	scheduler.step()
 
-	return (loss_sum/samp_sum).item() # >>>> CPU-GPU SYNC <<<<
+	# SYNC
+	return {'tloss':(loss_sum/n_samples).item()}
 
 
 @torch.no_grad()
 def validate(model,gpu_norm,diffusion,loader,device):
 	'''
-	Noise-prediction (MSE) loss over the full validation set.
+	Noise-prediction (MSE) loss over the full validation set. t and noise are drawn
+	from a fixed seed, so every epoch is scored on the same (x0,t,noise) triples.
 	'''
-
 	model.eval()
 
-	mse_loss_sum = torch.zeros(1,device=device)
-	n_samples    = torch.zeros(1,device=device)
+	loss_sum  = torch.zeros(1,device=device)
+	n_samples = torch.zeros(1,device=device)
 
-	for vnir,mask in loader:
+	# FORK THE RNG SO THE FIXED SEED DOES NOT RESET THE TRAINING RNG STREAM
+	with torch.random.fork_rng(devices=[device] if device.type == 'cuda' else []):
+		torch.manual_seed(VAL_SEED)
 
-		vnir = vnir.to(device,non_blocking=True)
-		mask = mask.to(device,non_blocking=True)
-		vnir,mask = gpu_norm(vnir,mask)
+		for vnir,mask in loader:
 
-		# x0 = mask_to_x0(mask,n_classes)
-		t  = torch.randint(0,diffusion.timesteps,(vnir.shape[0],),device=device,dtype=torch.long)
+			vnir = vnir.to(device,non_blocking=True)
+			mask = mask.to(device,non_blocking=True)
+			x0,_ = gpu_norm(vnir,mask)
 
-		with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
-			mse_loss = diffusion.p_loss(x0,vnir,t) # ADJUST TO UNCONDITIONED
+			t = torch.randint(0,diffusion.timesteps,(x0.shape[0],),device=device,dtype=torch.long)
 
-		mse_loss_sum += mse_loss.detach() * vnir.size(0)
-		n_samples    += vnir.size(0)
+			with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
+				loss = diffusion.p_loss(x0,t)
 
-	return (mse_loss_sum/n_samples).item()
+			loss_sum  += loss * x0.size(0)
+			n_samples += x0.size(0)
+
+	# SYNC
+	return {'vloss':(loss_sum/n_samples).item()}
 
 
-def train_and_validate():
+@torch.no_grad()
+def sample_and_score():
+	'''
+	Calculate FID LPIPS metrics over a set sampled/generated images vs validation features
+	'''
+	# SAMPLE ALL PREDEFINED NUMBER OF IMAGES
 
-	# 0.PRECALCULATE VALIDATION FEATURE STATISTICS
-
-	# 1.TRAIN
-
-	# 2.VALIDATE (MSE ONLY)
-
-	# 3. SCORE FID,LPIPS
-
-	# LOG
-
-	# CHECKPOINTS
+	# CALCULATE FID
 	pass
+
+	# CALCULATE INTRA LPIPS
+	pass
+
+
+def train_and_validate(model,gpu_aug,gpu_norm,diffusion,dataloaders,optimizer,scheduler,device,epochs=100):
+	'''
+	Train, validate (MSE), log, and keep the best checkpoint by validation MSE.
+	'''
+	logger  = utils.DiffLogger(f'{LOG_DIR}/diff_{model.model_id:03}.tsv')
+	tracker = utils.RecentBestTracker(n=1)
+	best_loss  = float('inf')
+	best_epoch = 0
+
+	# 0.PRECALCULATE VALIDATION FEATURE STATISTICS -- TODO (FID)
+	validation_set_statistics()
+
+	total_time_t0 = time.perf_counter()
+
+	for epoch in range(epochs):
+
+		print(f'--- EPOCH {epoch:04} ---')
+		epoch_time_t0 = time.perf_counter()
+
+		# 1.TRAIN
+		tr_result = train(model,gpu_aug,diffusion,dataloaders['training'],optimizer,scheduler,device)
+
+		# 2.VALIDATE (MSE ONLY)
+		va_result = validate(model,gpu_norm,diffusion,dataloaders['validation'],device)
+
+		# 3.SCORE FID,LPIPS -- TODO, NEEDS UNGUIDED SAMPLING IN diffusion.py
+		sample_flag = (epoch+1) % 10 == 0
+
+		if sample_flag:
+			scores = sample_and_score()
+		else:
+			# dummy in logs
+			scores = {}
+
+		epoch_time_t1 = time.perf_counter()
+
+		# LOG
+		logger.log({'epoch':epoch,**tr_result,**va_result,**scores})
+		print(f"[T] LOSS: {tr_result['tloss']:.5f} | [V] LOSS: {va_result['vloss']:.5f}")
+
+		# CHECKPOINTS -- SKIP WARMUP; LOWEST VALIDATION MSE SELECTS THE BEST
+		if (epoch+1)>10 and va_result['vloss'] < best_loss:
+			best_loss  = va_result['vloss']
+			best_epoch = epoch
+			pth_path = utils.save_checkpoint(MODEL_DIR,model,optimizer,epoch,tag='diff')
+			tracker.update(pth_path)
+
+		# STDOUT LOG EPOCH TIME
+		print(f"Epoch time: {epoch_time_t1-epoch_time_t0:.2f} secs.")
+
+	total_time_t1 = time.perf_counter()
+	mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+	# STDOUT LOG OVERALL
+	print(f'Total time: {(total_time_t1-total_time_t0)/60:.1f} min')
+	print(f'Best epoch: {best_epoch} | MSE: {best_loss:.5f}')
+	print(f'Peak GPU memory allocated: {mem_gb:.2f} GB')
 
 
 @torch.no_grad()
 def plot_samples(model,diffusion,device):
 	'''
-	Plot some images generated from random noise.
+	Plot some images generated from random noise. TODO -- NEEDS UNGUIDED SAMPLING IN diffusion.py
 	'''
 	pass
 
 
+################################################################################
+# MAIN/SETUP
+################################################################################
 if __name__ == '__main__':
 
-	# SETUP
+	# PARSE ARGS/FILES, SET SEED
 	args = parse_args()
 	hp   = utils.load_hyperparameters(args)
 	utils.set_seed(hp['seed'])
@@ -186,15 +253,27 @@ if __name__ == '__main__':
 
 	# CHECK HYPERPARAMETERS
 	lrate,decay,epochs,batch = hp['lrate'],hp['decay'],hp['epochs'],hp['batch']
-	assert hp['encoder'] in ['cnn','vit'], f"Unknown encoder {hp['encoder']}"
-	assert hp['decoder'] in ['cnn','vit'], f"Unknown decoder {hp['decoder']}"
+	assert hp['arch'] in ['cnn','vit'], f"Unknown arch {hp['arch']}"
 	assert lrate > 0 and decay >= 0, f"Got lrate {lrate}, decay {decay}"
 	assert epochs > 10, f"Got {epochs} epochs; 10 are warmup"
-	has_vit = 'vit' in (hp['encoder'],hp['decoder'])
-	assert (hp['vit_layers'] >= 1) if has_vit else (hp['vit_layers'] == 0), f"Got vit_layers {hp['vit_layers']} for {hp['encoder']}-{hp['decoder']}"
+	assert (hp['vit_layers'] >= 1) if hp['arch'] == 'vit' else (hp['vit_layers'] == 0), f"Got vit_layers {hp['vit_layers']} for arch {hp['arch']}"
+	timesteps = hp.get('timesteps',1000)
 
-	# THE UNGUIDED DDPM MODEL
-	ddpm = models.UnconditionedDenoiser()
+	# THE UNGUIDED DENOISER -- PREDICTS THE NOISE ON ALL 4 BANDS
+	ddpm = models.UnconditionedDenoiser(
+		hp['id'],
+		arch=hp['arch'],
+		cnn_layers=hp['cnn_layers'],
+		vit_layers=max(hp['vit_layers'],1), # IGNORED BY cnn
+		init_chan=hp['init_chan'],
+		mlp_ratio=hp.get('mlp_ratio',4),
+		time_dim=hp.get('time_dim',256),
+		in_channels=4,
+		out_channels=4
+	)
+	ddpm.to(device)
+	print(f"{hp['arch']} | init_chan {hp['init_chan']} | cnn_layers {hp['cnn_layers']} | vit_layers {hp['vit_layers']} | batch {batch} | lrate {lrate} | decay {decay}")
+	print(f'Parameters: {models.get_model_parameter_size(ddpm):,}')
 
 	# NO DECAY ON NORM WEIGHTS AND BIASES (ndim < 2)
 	params = list(ddpm.parameters())
@@ -202,7 +281,7 @@ if __name__ == '__main__':
 		{'params':[p for p in params if p.ndim >= 2],'weight_decay':decay},
 		{'params':[p for p in params if p.ndim < 2],'weight_decay':0.0}
 	]
-	optimizer = torch.optim.AdamW(param_groups,lr=lrate,fused=device.type == 'cuda') # single fused kernel for the whole update?
+	optimizer = torch.optim.AdamW(param_groups,lr=lrate,fused=device.type == 'cuda') # single fused kernel for the whole update
 
 	# SCHEDULER -- 10-EPOCH LINEAR WARMUP + COSINE ANNEALING W/O RESTARTS, FLOOR AT lrate/cosine_steps
 	warmup_steps = 10
@@ -213,20 +292,19 @@ if __name__ == '__main__':
 	cosine_sched = torch.optim.lr_scheduler.LambdaLR(optimizer,lr_lambda=cosine_factor)
 	scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer,schedulers=[warmup_sched,cosine_sched],milestones=[warmup_steps])
 
+	# COMPILE AFTER BUILDING THE OPTIMIZER; save_checkpoint UNWRAPS _orig_mod
 	ddpm = torch.compile(ddpm)
 
 	# LOAD DATASET TO RAM
 	bands_tr,masks_tr = dataloader.load_cached_split(args.data_dir,split='training')
 	bands_va,masks_va = dataloader.load_cached_split(args.data_dir,split='validation')
-	dset_tr = dataloader.SentinelFastDataset(bands_tr,masks_tr)
-	dset_va = dataloader.SentinelFastDataset(bands_va,masks_va)
 
-	# NORMALIZE? 
-	# gpu_norm = dataloader.GPUValidationTransform().to(device)
+	# GEOMETRIC AUGS ONLY: GAIN WOULD SHIFT THE BAND DISTRIBUTION THE MODEL IS LEARNING
+	gpu_aug  = dataloader.GPULabeledTransform(gain=0.0).to(device)
+	gpu_norm = dataloader.GPUValidationTransform().to(device)
 
-	# DATALOADERS
 	dloader_tr = DataLoader(
-		dataset=dset_tr,
+		dataset=dataloader.SentinelFastDataset(bands_tr,masks_tr),
 		shuffle=True,
 		drop_last=True,
 		batch_size=batch,
@@ -237,7 +315,7 @@ if __name__ == '__main__':
 	)
 
 	dloader_va = DataLoader(
-		dataset=dset_va,
+		dataset=dataloader.SentinelFastDataset(bands_va,masks_va),
 		shuffle=False,
 		drop_last=False,
 		batch_size=batch,
@@ -248,15 +326,10 @@ if __name__ == '__main__':
 	)
 	dataloaders = {'training':dloader_tr,'validation':dloader_va}
 
-	# FIXED SUBSET FOR DDIM-SAMPLED METRICS: 512 CHIPS EVENLY SPACED OVER THE (SORTED) VALIDATION SET
-	sample_idx = np.unique(np.linspace(0,len(dset_va)-1,min(512,len(dset_va)),dtype=int))
-	dloader_sampling = DataLoader(
-		Subset(dset_va,sample_idx.tolist()),
-		batch_size=2*hp['batch'], # no gradients -> room for larger batches, fewer sequential DDIM calls
-		drop_last=False,
-		shuffle=False,
-		**loader_kwargs)
+	# DIFFUSION PROCESS AROUND THE (COMPILED) DENOISER
+	# SAMPLED x0 CLIPPED PER BAND TO THE NORMALIZED uint8 RANGE
+	x0_min = ((0.0-dataloader.MEAN)/dataloader.STDD).flatten()
+	x0_max = ((255.0-dataloader.MEAN)/dataloader.STDD).flatten()
+	diffusion = GaussianDiffusion(ddpm,timesteps=timesteps,ddim_steps=hp.get('ddim_steps',100),device=device,guided=False,x0_min=x0_min,x0_max=x0_max)
 
-	diffusion = GaussianDiffusion(ddpm,timesteps=1000,ddim_steps=100,device=device)
-
-	pass
+	train_and_validate(ddpm,gpu_aug,gpu_norm,diffusion,dataloaders,optimizer,scheduler,device,epochs=epochs)

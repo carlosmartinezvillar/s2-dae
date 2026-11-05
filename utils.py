@@ -4,18 +4,25 @@ import torch
 import random
 import json
 
-# TODO
 class DiffLogger():
 	'''
 	Class to log the metrics of unguided diffusion pre-training.
 	'''
 	def __init__(self,path):
 		self.path = path
+		self.header = None
 
 	def log(self,metrics):
-		return True
+		if self.header is None:
+			self.header = list(metrics.keys())
+			with open(self.path,'w') as fp:
+				fp.write('\t'.join(self.header)+'\n')
 
-# TODO
+		row = [f'{v:.5f}' if isinstance(v,float) else str(v) for v in metrics.values()]
+		with open(self.path,'a') as fp:
+			fp.write('\t'.join(row) + '\n')
+
+
 class BTLogger():
 	'''
 	Class to log the metrics of BT.

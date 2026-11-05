@@ -971,7 +971,7 @@ class UnconditionedDenoiser(nn.Module):
 ################################################################################
 class ConditionedDenoiser(nn.Module):
 
-	def __init__(self,model_id,cnn_layers=2,vit_layers=1,init_chan_cond=32,init_chan_diff=16,time_dim=256):
+	def __init__(self,model_id,cnn_layers=2,vit_layers=1,init_chan_cond=32,init_chan_diff=32,time_dim=256):
 		super().__init__()
 
 		self.model_name = "S2SegDiff"
@@ -988,11 +988,11 @@ class ConditionedDenoiser(nn.Module):
 		self.in_layer = nn.Conv2d(2,init_chan_diff,kernel_size=1,stride=1,padding=0,bias=True)
 
 		# Denoising encoder & decoder
-		self.encoder = DenoisingCNNEncoder(cnn_layers,vit_layers,channels,mlp_ratio,time_dim,context_dims)
-		self.decoder = DenoisingCNNDecoder(cnn_layers,vit_layers,channels,mlp_ratio,time_dim,context_dims)
+		self.encoder = GuidedDenoisingCNNEncoder(cnn_layers,vit_layers,init_chan_diff,mlp_ratio,time_dim,context_dims)
+		self.decoder = GuidedDenoisingCNNDecoder(cnn_layers,vit_layers,init_chan_diff,mlp_ratio,time_dim,context_dims)
 
 		# final 1x1 classifier
-		self.out_layer = nn.Conv2d(channels,mask_channels,kernel_size=1,bias=True)
+		self.out_layer = nn.Conv2d(init_chan_diff,mask_channels,kernel_size=1,bias=True)
 
 	def forward(self,x_t,t,vnir_image):
 		t_emb   = self.time_embedder(t)
