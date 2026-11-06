@@ -102,8 +102,16 @@ def train(model,gpu_aug,diffusion,loader,optimizer,scheduler,device):
 		x0  = mask_to_x0(mask,2)
 		t   = torch.randint(0,diffusion.timesteps,(vnir.shape[0],),device=device,dtype=torch.long)
 
+		# FORWARD -- NOISE x0 (MASK) TO x_t, PREDICT THE NOISE CONDITIONED ON THE BANDS
 		with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
-			loss = diffusion.p_loss(x0,t,vnir)
+
+			noise = torch.randn_like(x0)
+
+			x_t = diffusion.q_sample(x0,t,noise)
+
+			predicted_noise = model(x_t,t,vnir).float()
+
+			loss = F.mse_loss(predicted_noise,noise)
 
 		optimizer.zero_grad()
 		loss.backward()
@@ -139,8 +147,16 @@ def validate(model,gpu_norm,diffusion,loader,device):
 		x0 = mask_to_x0(mask,n_classes)
 		t  = torch.randint(0,diffusion.timesteps,(vnir.shape[0],),device=device,dtype=torch.long)
 
+		# FORWARD -- NOISE x0 (MASK) TO x_t, PREDICT THE NOISE CONDITIONED ON THE BANDS
 		with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
-			mse_loss = diffusion.p_loss(x0,t,vnir)
+
+			noise = torch.randn_like(x0)
+
+			x_t = diffusion.q_sample(x0,t,noise)
+
+			predicted_noise = model(x_t,t,vnir).float()
+
+			mse_loss = F.mse_loss(predicted_noise,noise)
 
 		mse_loss_sum += mse_loss.detach() * vnir.size(0)
 		n_samples    += vnir.size(0)
@@ -175,11 +191,14 @@ def validate_with_sampling(model,gpu_norm,diffusion,dataloader,device,n_classes=
 			mask = mask.to(device,non_blocking=True)
 
 			with torch.autocast(device_type=device.type,dtype=torch.bfloat16,enabled=True):
-				# x0_pred = diffusion.p_sample_loop(mask_to_x0(mask,n_classes),vnir)
-				x0_pred = diffusion.ddim_sample_loop(mask_to_x0(mask,n_classes),vnir) # MASK ONLY SETS THE SHAPE OF x_T
+				# STARTING NOISE x_T IN MASK SPACE [B,mask_channels,H,W]
+				x_t = torch.randn((vnir.shape[0],mask_channels(n_classes),*vnir.shape[-2:]),device=device)
+
+				# x0_pred = diffusion.p_sample_loop(x_t,vnir)
+				x0_pred = diffusion.ddim_sample_loop(x_t,vnir)
 			pred_mask = x0_to_mask(x0_pred)
 
-			ce_loss_sum += calculate_cross_entropy(x0_pred.float(),lbl) * vnir.size(0)
+			ce_loss_sum += calculate_cross_entropy(x0_pred.float(),mask) * vnir.size(0)
 			n_samples   += vnir.size(0)
 
 			utils.update_confusion_matrix(gpu_cmat,mask,pred_mask,n_classes)

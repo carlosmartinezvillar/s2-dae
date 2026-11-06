@@ -3,7 +3,7 @@ A diffusion class to keep
 * forward process
 * reverse step
 * reverse process
-* 
+* reverse process DDIM
 '''
 import math
 import torch
@@ -185,35 +185,30 @@ class GaussianDiffusion:
 
 
 	@torch.no_grad()
-	def p_sample_loop(self,x0,cond_image=None,generator=None):
+	def p_sample_loop(self,x_t,cond_image=None,generator=None):
 		'''
 		Full reverse process: x_T ~ N(0,I) -> x_0
-		x0: tensor with the shape of the denoised target; only its shape and device are used for x_T
-		(unguided: the VNIR batch; guided: the mask as x0). cond_image: guided models only.
-		generator must live on x0.device.
+		x_t: the starting noise x_T [B,C,H,W], drawn by the caller. cond_image: guided models only.
+		generator: for the noise added at each step; must live on x_t.device.
 		'''
-		x_t = torch.randn(x0.shape,generator=generator,device=x0.device)
-		B   = x0.shape[0]
+		B = x_t.shape[0]
 
 		for t_index in reversed(range(self.timesteps)):
-			t   = torch.full((B,), t_index, device=x0.device, dtype=torch.long)
+			t   = torch.full((B,), t_index, device=x_t.device, dtype=torch.long)
 			x_t = self.p_sample(x_t,t,t_index,cond_image,generator)
 
 		return x_t
 
 
 	@torch.no_grad()
-	def ddim_sample_loop(self,x0,cond_image=None,generator=None):
+	def ddim_sample_loop(self,x_t,cond_image=None):
 		'''
 		Denoising Diffusion Implicit Models (DDIM) Song et al. (2020).
 		Reverse process sampling with skipped timesteps for faster validation.
-		x0: tensor with the shape of the denoised target; only its shape and device are used for x_T
-		(unguided: the VNIR batch; guided: the mask as x0). cond_image: guided models only.
-		generator must live on x0.device.
+		x_t: the starting noise x_T [B,C,H,W], drawn by the caller. Deterministic given x_t.
+		cond_image: guided models only.
 		'''
-		# Start with pure noise
-		x_t = torch.randn(x0.shape,generator=generator,device=x0.device)
-		B   = x0.shape[0]
+		B = x_t.shape[0]
 
 		# Loop backwards through substeps
 		for i in reversed(range(len(self.ddim_timesteps))):
