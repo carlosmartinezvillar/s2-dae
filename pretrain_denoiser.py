@@ -7,6 +7,8 @@ UNGUIDED: GaussianDiffusion(...,guided=False); the model is called as model(x_t,
 '''
 
 import os
+import glob
+import json
 import math
 import torch
 import torch.nn.functional as F
@@ -201,19 +203,44 @@ def validation_set_statistics(encoder,dataloader,gpu_norm,device,n_pairs=1024,se
 	return {'feats':feats,'mu':mu,'sigma':sigma,'hist':hist,'grad':grad_sum/n_diff,'lpips':lpips_r}
 
 
-def load_encoder_checkpoint(id=0,epoch=0000):
-	bt_id = f'{id:03}'
-	epoch_str = f'{epoch:04}'
+def load_encoder_checkpoint(bt_id,bt_run,epoch=None):
+	'''
+	Load the frozen BT encoder used by the metrics (fid, kid, lpips).
+	Reads {MODEL_DIR}/bt_{bt_id:03}_e{epoch:04}.pth.tar, latest epoch if epoch is None (BT pretraining
+	saves only its last epoch; k8s/diff_pretrain.sh copies it from /model_pvc/<bt_run>).
+	The architecture comes from row bt_id of ./hpo/{bt_run}.json, so the strict load matches the checkpoint.
+	'''
+	assert bt_id is not None, "bt_id not set: rerun hpo/experiments.py set_experiments_diff_pretrain(bt_id=<best bt_probe encoder>)"
 
-	path = f"{MODEL_DIR}/bt_{bt_id}_e{epoch_str}.pth.tar"
+	# BT ARCHITECTURE FROM ITS PARAMS ROW
+	bt_path = f'./hpo/{bt_run}.json'
+	with open(bt_path,'r') as fp:
+		bt_rows = {row['id']:row for row in map(json.loads,filter(str.strip,fp))}
+	assert bt_id in bt_rows, f"BT id {bt_id} not in {bt_path}"
+	bt_hp = bt_rows[bt_id]
+
+	# FIND CHECKPOINT
+	epoch_str = '*' if epoch is None else f'{epoch:04}'
+	paths = sorted(glob.glob(f"{MODEL_DIR}/bt_{bt_id:03}_e{epoch_str}.pth.tar"))
+	assert paths, f"No BT checkpoint bt_{bt_id:03}_e{epoch_str}.pth.tar in {MODEL_DIR}"
+	path = paths[-1] # ZERO-PADDED EPOCHS, SO LAST IS LATEST
 	checkpoint = torch.load(path,map_location='cpu',weights_only=True)
 
+	# REBUILD AS BarlowTwins, LOAD STRICTLY (CATCHES ARCHITECTURE MISMATCH)
 	bt_net = models.BarlowTwins(
-		model_id = bt_id
+		model_id=bt_id,
+		init_chan=bt_hp['init_chan'],
+		cnn_layers=bt_hp['cnn_layers'],
+		proj_dim=bt_hp['proj_dim'],
+		encoder=bt_hp.get('encoder','cnn')
 	)
 	bt_net.load_state_dict(checkpoint['model_state_dict'],strict=True)
+	print(f"Loaded metric encoder from {path} (epoch {checkpoint['epoch']}, {bt_hp.get('encoder','cnn')}, init_chan {bt_hp['init_chan']})")
 
-	return bt_net.encoder
+	# KEEP ENCODER, DROP PROJECTOR; FROZEN
+	encoder = bt_net.encoder
+	encoder.requires_grad_(False)
+	return encoder.eval()
 
 
 def train(model,gpu_aug,diffusion,loader,optimizer,scheduler,device):
@@ -393,7 +420,7 @@ def train_and_validate(model,encoder,gpu_aug,gpu_norm,diffusion,dataloaders,opti
 	best_kid   = float('inf')
 	best_epoch = 0
 
-	# 0.PRECALCULATE VALIDATION FEATURE STATISTICS -- TODO (FID)
+	# 0.PRECALCULATE VALIDATION REFERENCE STATISTICS (FEATURES, HISTOGRAMS, GRADIENTS, LPIPS)
 	real = validation_set_statistics(encoder,dataloaders['validation'],gpu_norm,device)
 	print(f"Validation reference LPIPS (diversity): {real['lpips']:.5f}")
 
@@ -410,7 +437,7 @@ def train_and_validate(model,encoder,gpu_aug,gpu_norm,diffusion,dataloaders,opti
 		# 2.VALIDATE (MSE ONLY)
 		va_result = validate(model,gpu_norm,diffusion,dataloaders['validation'],device)
 
-		# 3.SCORE FID,LPIPS -- EVERY 10 EPOCHS
+		# 3.SCORE SAMPLES (FID, KID, W1, HF, LPIPS) -- EVERY 10 EPOCHS
 		sample_flag = (epoch+1) % 10 == 0
 
 		if sample_flag:
@@ -447,7 +474,7 @@ def train_and_validate(model,encoder,gpu_aug,gpu_norm,diffusion,dataloaders,opti
 @torch.no_grad()
 def plot_samples(model,diffusion,device):
 	'''
-	Plot some images generated from random noise. TODO -- NEEDS UNGUIDED SAMPLING IN diffusion.py
+	Plot some images generated from random noise. TODO
 	'''
 	pass
 
@@ -495,7 +522,7 @@ if __name__ == '__main__':
 	optimizer = torch.optim.AdamW(param_groups,lr=lrate,fused=device.type == 'cuda') # single fused kernel for the whole update
 
 	# AN AUXILIARY FIXED ENCODER TO PRODUCE AN UNBIASED SET OF FEATURES THROUGHOUT TRAINING 
-	encoder = load_encoder_checkpoint()
+	encoder = load_encoder_checkpoint(hp.get('bt_id'),hp.get('bt_run','bt_pretrain_final'))
 	encoder = encoder.to(device)
 	encoder = torch.compile(encoder)
 

@@ -24,6 +24,20 @@ NET_DIR="${CACHE_DIR}/model"
 LOG_DIR="${CACHE_DIR}/logs"
 PARAMS_FILE="./hpo/${RUN_NAME}.json"
 
+# PARAMS ROW LOOKUP: hp[key] IF SET, ELSE <default> IF GIVEN, ELSE hp['id']
+hp_get() {
+  python3 -c '
+import json,sys
+rows = {r["id"]:r for r in map(json.loads,filter(str.strip,open(sys.argv[1])))}
+row  = rows[int(sys.argv[2])]
+print(row.get(sys.argv[3],sys.argv[4] if len(sys.argv) > 4 else row["id"]))
+' "$PARAMS_FILE" "$MODEL_ID" "$@"
+}
+
+# RUN WHOSE CHECKPOINT HOLDS THE METRIC ENCODER (A bt_pretrain.sh OUTPUT):
+# hp['bt_run'] IF SET, ELSE bt_pretrain_final (THE BEST bt_probe ENCODER TRAINED LONG)
+BT_RUN="$(hp_get bt_run bt_pretrain_final)"
+
 MODEL_OUT_DIR="${MODEL_PVC}/${RUN_NAME}"
 LOG_OUT_DIR="${LOG_PVC}/${RUN_NAME}"
 
@@ -32,14 +46,21 @@ FAIL_MARKER="${LOG_OUT_DIR}/model_${MODEL_ID_PADDED}.failed"
 STDOUT_LOG_LOCAL="${LOG_DIR}/model_${MODEL_ID_PADDED}_stdout.log"
 STDOUT_LOG_PVC="${LOG_OUT_DIR}/model_${MODEL_ID_PADDED}_stdout.log"
 
+# RUN_NAME MUST NOT BE THE BT RUN: OUTPUTS WOULD LAND IN THE BT FOLDERS (on_exit
+# DELETES *_<id>_e*.pth.tar THERE, THE rm BELOW DROPS ITS MARKERS) AND JOB NAMES WOULD
+# COLLIDE WITH THE PRETRAIN JOBS.
+[ "$RUN_NAME" != "$BT_RUN" ] || { echo "RUN_NAME must differ from $BT_RUN"; exit 1; }
+
 mkdir -p "$MODEL_OUT_DIR" "$LOG_OUT_DIR"
 
 # A RERUN STARTS FROM A CLEAN STATE: NO STALE MARKERS, NO OLD STDOUT APPENDED TO
 rm -f "$DONE_MARKER" "$FAIL_MARKER" "$STDOUT_LOG_PVC"
 
 echo "Copying dataset files..."
-cp "${CHIPS_PVC}/training_bands.npy" "$CACHE_DIR/"
-cp "${CHIPS_PVC}/training_masks.npy" "$CACHE_DIR/"
+for split in training validation; do
+  cp "${CHIPS_PVC}/${split}_bands.npy" "$CACHE_DIR/"
+  cp "${CHIPS_PVC}/${split}_masks.npy" "$CACHE_DIR/"
+done
 
 mkdir -p "$NET_DIR" "$LOG_DIR"
 cd "$REPO_DIR"
@@ -52,6 +73,9 @@ touch "$STDOUT_LOG_LOCAL"
 tail -F "$STDOUT_LOG_LOCAL" >> "$STDOUT_LOG_PVC" &
 TAIL_PID=$!
 
+# PRE-TRAINED CHECKPOINTS COPIED INTO NET_DIR -- DROPPED BEFORE THE COPY BACK
+STAGED=()
+
 on_exit() {
   status=$?
   kill "$TAIL_PID" 2>/dev/null || true
@@ -60,6 +84,7 @@ on_exit() {
     # FILENAMES CARRY THE EPOCH, SO cp ALONE WOULD LEAVE A PREVIOUS RUN'S
     # CHECKPOINTS NEXT TO THESE. ONLY DROPPED ON SUCCESS, SO A FAILED RERUN
     # KEEPS THE LAST GOOD ONES.
+    rm -f "${STAGED[@]}"
     rm -f "${MODEL_OUT_DIR}"/*_"${MODEL_ID_PADDED}"_e*.pth.tar
     cp -v "${NET_DIR}"/*.pth.tar "$MODEL_OUT_DIR/" 2>/dev/null || true
     cp -v "${LOG_DIR}"/*.tsv "$LOG_OUT_DIR/" 2>/dev/null || true
@@ -73,6 +98,16 @@ trap on_exit EXIT
 
 # kubectl delete SENDS SIGTERM: EXIT THROUGH on_exit SO THE .failed MARKER IS WRITTEN
 trap 'exit 143' TERM INT
+
+# COPY THE LATEST BT CHECKPOINT OF THE METRIC ENCODER -- pretrain_denoiser.py READS IT FROM --net-dir.
+# NO FALLBACK TO id: HERE id IS THE DENOISER, bt_id MUST BE SET IN THE ROW (hpo/experiments.py)
+BT_ID="$(hp_get bt_id None)"
+[ "$BT_ID" != "None" ] || { echo "bt_id not set in $PARAMS_FILE row $MODEL_ID: rerun set_experiments_diff_pretrain(bt_id=...)"; exit 1; }
+BT_ID_PADDED=$(printf "%03d" "$BT_ID")
+BT_CKPTS=("${MODEL_PVC}/${BT_RUN}/bt_${BT_ID_PADDED}_e"*.pth.tar)
+[ -f "${BT_CKPTS[-1]}" ] || { echo "No bt_${BT_ID_PADDED}_e*.pth.tar in ${MODEL_PVC}/${BT_RUN}"; exit 1; }
+cp -v "${BT_CKPTS[-1]}" "$NET_DIR/"
+STAGED+=("${NET_DIR}/$(basename "${BT_CKPTS[-1]}")")
 
 # BACKGROUND + wait: BASH DEFERS TRAPS UNTIL A FOREGROUND COMMAND RETURNS, BUT
 # wait IS INTERRUPTED BY THEM. wait $! STILL RETURNS THE PIPEFAIL STATUS.
