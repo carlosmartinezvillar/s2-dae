@@ -237,7 +237,7 @@ class TimeViTBlock(nn.Module):
 ################################################################################
 # BLOCKS COMBINING CONTEXT
 ################################################################################
-class ContextViTLayer(nn.Module):
+class ContextCrossAttnViTLayer(nn.Module):
 	'''
 	Complete ViT layer with added cross attention for VNIR context
 	'''
@@ -270,7 +270,7 @@ class ContextViTLayer(nn.Module):
 		return tokens
 
 
-class ContextViTBlock(nn.Module):
+class ContextCrossAttnViTBlock(nn.Module):
 	'''
 	Wrapper for ViT layers for image-token-image conversion.
 	'Block' means a grouping intended as equivalent to 'convolutional' block in CNNs.
@@ -280,7 +280,7 @@ class ContextViTBlock(nn.Module):
 	'''
 	def __init__(self,E,num_heads,time_dim,context_dim,mlp_ratio=4,depth=1):
 		super().__init__()
-		self.block = nn.ModuleList([ContextViTLayer(E,num_heads,time_dim,context_dim,mlp_ratio) for _ in range(depth)])
+		self.block = nn.ModuleList([ContextCrossAttnViTLayer(E,num_heads,time_dim,context_dim,mlp_ratio) for _ in range(depth)])
 		# self.s_attn = 
 		# self.c_attn = ConditionedViTLayer(E,num_heads,time_dim,context_dim,mlp_ratio)
 
@@ -294,6 +294,74 @@ class ContextViTBlock(nn.Module):
 		for layer in self.block:
 			tokens = layer(tokens,t_emb,context_tokens)
 		return tokens.reshape(B,H,W,C).permute(0,3,1,2)
+
+
+class ContextViTLayer(nn.Module):
+	'''
+	ViT layer (MHSA + MLP, timestep-modulated) inside ContextViTBlock. It only sees the token sequence:
+	the block adds the context to the feature map before tokenizing, so the layer itself is a TimeViTLayer
+	(same names and computation).
+	'''
+	def __init__(self,E,num_heads,time_dim,mlp_ratio=4):
+		super().__init__()
+		self.norm1 = nn.LayerNorm(E)
+		self.attn  = MultiHeadSelfAttention(E,num_heads)
+		self.time_proj1 = nn.Linear(time_dim,E*2)
+
+		self.norm2 = nn.LayerNorm(E)
+		self.mlp   = MLP(E, mlp_ratio)
+		self.time_proj2 = nn.Linear(time_dim,E*2)
+
+	def forward(self,tokens,t_emb):
+		scale,shift = self.time_proj1(t_emb).chunk(2,dim=-1)
+		h = self.norm1(tokens) * (1 + scale[:,None,:]) + shift[:,None,:]
+		tokens = tokens + self.attn(h)
+
+		scale,shift = self.time_proj2(t_emb).chunk(2,dim=-1)
+		h = self.norm2(tokens) * (1 + scale[:,None,:]) + shift[:,None,:]
+		tokens = tokens + self.mlp(h)
+		return tokens
+
+
+class ContextViTBlock(nn.Module):
+	'''
+	Wrapper for ViT layers for image-token-image conversion.
+	'Block' means a grouping intended as equivalent to 'convolutional' block in CNNs.
+	Takes an 'image-shaped' feature map [B,C,H,W]. Returns tensor of same shape.
+	Context [B,C_context,H,W] must match the block's H,W; as in ContextCNNBlock, a 1x1 conv projects it to
+	the block's channels and it is added to the feature map before tokenizing (spatial layout kept). The
+	projected context is removed again on the way out, so the block returns x + (sum of the layers' residual
+	updates): context only acts through the attention/MLP branches, the ViT form of x + f(x + c).
+	Layer names match TimeViTBlock and context_proj starts at zero, so a TimeViTBlock checkpoint loads with
+	strict=False (missing: context_proj only) and the block starts out computing exactly what TimeViTBlock did.
+	For context on a different grid use ContextCrossAttnViTBlock.
+	'''
+	def __init__(self,E,num_heads,time_dim,context_dim,mlp_ratio=4,depth=1):
+		super().__init__()
+		self.block = nn.ModuleList([ContextViTLayer(E,num_heads,time_dim,mlp_ratio) for _ in range(depth)])
+
+		# CONTEXT CHANNELS -> BLOCK CHANNELS. ZERO-INIT: NO CONTEXT EFFECT AT START
+		self.context_proj = nn.Conv2d(context_dim,E,kernel_size=1,bias=True)
+		nn.init.zeros_(self.context_proj.weight)
+		nn.init.zeros_(self.context_proj.bias)
+
+	def forward(self,x,t_emb,context):
+		B,C,H,W = x.shape
+
+		# ADDITION IS PER POSITION: CONTEXT MUST BE ON THE SAME GRID
+		assert context.shape[-2:] == (H,W), f"context {tuple(context.shape[-2:])} does not match the feature map {(H,W)}"
+		c = self.context_proj(context) # [B,C,H,W]
+
+		# ADD CONTEXT AS A FEATURE MAP, THEN TOKENIZE
+		h = x + c
+		tokens = h.permute(0,2,3,1).reshape(B,H*W,C)
+
+		for layer in self.block:
+			tokens = layer(tokens,t_emb)
+		out = tokens.reshape(B,H,W,C).permute(0,3,1,2)
+
+		# REMOVE c FROM THE SKIP PATH: x + (LAYER UPDATES), AS x + f(x + c) IN ContextCNNBlock
+		return out - c
 
 
 class ContextCNNBlock(nn.Module):
@@ -382,7 +450,7 @@ class UnguidedDenoisingViTEncoder(nn.Module):
 	All blocks timestep-conditioned, no context.
 	Takes x already projected to 'channels' (the denoiser's in_layer does that).
 	Stage names, heads and depths match GuidedDenoisingViTEncoder, so its weights load
-	there (missing: cross_attn and norm_context only).
+	there (missing: context_proj only).
 	'''
 	def __init__(self,cnn_layers=3,vit_layers=1,channels=32,mlp_ratio=4,time_dim=256):
 		super().__init__()
@@ -449,11 +517,11 @@ class GuidedDenoisingCNNEncoder(nn.Module):
 class GuidedDenoisingViTEncoder(nn.Module):
 	'''
 	Hybrid CNN/ViT without positional encoding. 2xCNN + 3xViT layers.
-	All blocks timestep-conditioned, context at every stage: added in the CNN
-	stages (c1,c2), cross-attended in the ViT stages (c3,c4,c5).
+	All blocks timestep-conditioned, context added at every stage: ContextCNNBlock in the
+	CNN stages (c1,c2), ContextViTBlock in the ViT stages (c3,c4,c5).
 	context_dims: BT encoder channels at c1..c5 (e.g. init_chan*(1,2,4,8,16)).
 	Stage names match UnguidedDenoisingViTEncoder, so its weights load here with
-	only context_proj, cross_attn and norm_context missing (all start with no effect).
+	only context_proj missing (starts at zero, no effect).
 	'''
 
 	def __init__(self,cnn_layers=3,vit_layers=1,channels=32,mlp_ratio=4,time_dim=256,context_dims=(32,64,128,256,512)):
@@ -530,8 +598,7 @@ class UnguidedDenoisingViTDecoder(nn.Module):
 	3-stage ViT & 2-stage CNN, all blocks timestep-conditioned, no context.
 	Mirrors UnguidedDenoisingViTEncoder. Returns features at 'channels' width; the
 	denoiser's out_layer maps them to the output. Stage names, heads and depths match
-	GuidedDenoisingViTDecoder, so its weights load there (missing: cross_attn and
-	norm_context only).
+	GuidedDenoisingViTDecoder, so its weights load there (missing: context_proj only).
 	'''
 	def __init__(self,cnn_layers=3,vit_layers=1,channels=32,mlp_ratio=4,time_dim=256):
 		super().__init__()
@@ -612,11 +679,11 @@ class GuidedDenoisingCNNDecoder(nn.Module):
 
 class GuidedDenoisingViTDecoder(nn.Module):
 	'''
-	3-stage ViT & 2-stage CNN. Mirrors GuidedDenoisingViTEncoder: context at every
-	stage, cross-attended in the ViT stages (c5,c4,c3), added in the CNN stages (c2,c1).
+	3-stage ViT & 2-stage CNN. Mirrors GuidedDenoisingViTEncoder: context added at every
+	stage, ContextViTBlock in the ViT stages (c5,c4,c3), ContextCNNBlock in the CNN stages (c2,c1).
 	context_dims: BT encoder channels at c1..c5. Returns features at 'channels' width.
 	Stage names match UnguidedDenoisingViTDecoder, so its weights load here with
-	only context_proj, cross_attn and norm_context missing (all start with no effect).
+	only context_proj missing (starts at zero, no effect).
 	'''
 	def __init__(self,cnn_layers=3,vit_layers=1,channels=32,mlp_ratio=4,time_dim=256,context_dims=(32,64,128,256,512)):
 		super().__init__()
@@ -970,33 +1037,54 @@ class UnconditionedDenoiser(nn.Module):
 # SEGMENTATION MODELS
 ################################################################################
 class ConditionedDenoiser(nn.Module):
-
-	def __init__(self,model_id,cnn_layers=2,vit_layers=1,init_chan_cond=32,init_chan_diff=32,time_dim=256):
+	'''
+	Guided time-conditioned U-Net: denoises the mask x_t [B,mask_channels,H,W] conditioned on the VNIR bands.
+	cond_encoder picks the BT condition encoder on the bands: 'cnn' (ConditionCNNEncoder) or 'vit'
+	(ConditionViTEncoder, 1 ViT layer per stage as in the BT checkpoints). Its 5 stage outputs, with
+	init_chan_cond*(1,2,4,8,16) channels on the same grids as the denoiser stages, are the context, added
+	at every stage (context_proj, zero-init).
+	arch picks the denoising encoder/decoder: 'cnn' (GuidedDenoisingCNN*) or 'vit' (GuidedDenoisingViT*).
+	Names match UnconditionedDenoiser (time_embedder, in_layer, encoder, decoder, out_layer), so a
+	diff_pretrain checkpoint of the same arch/init_chan/cnn_layers/vit_layers/time_dim loads with strict=False
+	after dropping in_layer.* and out_layer.* (bands in/out vs mask in/out); missing then: in_layer, out_layer,
+	context_proj and cond_encoder. cond_encoder loads from the 'encoder.*' weights of a BT checkpoint.
+	'''
+	def __init__(self,model_id,arch='vit',cond_encoder='cnn',cnn_layers=3,vit_layers=1,init_chan=16,init_chan_cond=32,cond_cnn_layers=2,mlp_ratio=4,time_dim=256,in_channels=4,mask_channels=1):
 		super().__init__()
 
+		# META
 		self.model_name = "S2SegDiff"
 		self.model_id   = model_id
 
 		# time embeddings
-		self.time_embedder = TimeEmbedding(init_chan_diff,time_dim=time_dim)
+		self.time_embedder = TimeEmbedding(init_chan,time_dim=time_dim)
 
-		# context embeddings
-		context_dims = (init_chan_cond*2,init_chan_cond*4,init_chan_cond*8,init_chan_cond*16)
-		self.cond_encoder  = ConditionCNNEncoder(channels=init_chan_cond,cnn_layers=cnn_layers)
+		# CONDITION ENCODER ON THE BANDS -> CONTEXT AT c1..c5
+		assert cond_encoder in ["cnn","vit"], f"Unknown cond_encoder '{cond_encoder}'"
+		if cond_encoder == 'cnn':
+			self.cond_encoder = ConditionCNNEncoder(channels=init_chan_cond,cnn_layers=cond_cnn_layers,in_channels=in_channels)
+		if cond_encoder == 'vit':
+			self.cond_encoder = ConditionViTEncoder(channels=init_chan_cond,cnn_layers=cond_cnn_layers,in_channels=in_channels)
+		context_dims = tuple(init_chan_cond*k for k in (1,2,4,8,16))
 
 		# Denoiser input projection layer to 'channels' argument
-		self.in_layer = nn.Conv2d(2,init_chan_diff,kernel_size=1,stride=1,padding=0,bias=True)
+		self.in_layer = nn.Conv2d(mask_channels,init_chan,kernel_size=1,stride=1,padding=0,bias=True)
 
 		# Denoising encoder & decoder
-		self.encoder = GuidedDenoisingCNNEncoder(cnn_layers,vit_layers,init_chan_diff,mlp_ratio,time_dim,context_dims)
-		self.decoder = GuidedDenoisingCNNDecoder(cnn_layers,vit_layers,init_chan_diff,mlp_ratio,time_dim,context_dims)
+		assert arch in ["cnn","vit"], f"Unknown arch '{arch}'"
+		if arch == 'cnn':
+			self.encoder = GuidedDenoisingCNNEncoder(cnn_layers=cnn_layers,channels=init_chan,time_dim=time_dim,context_dims=context_dims)
+			self.decoder = GuidedDenoisingCNNDecoder(cnn_layers=cnn_layers,channels=init_chan,time_dim=time_dim,context_dims=context_dims)
+		if arch == 'vit':
+			self.encoder = GuidedDenoisingViTEncoder(cnn_layers=cnn_layers,vit_layers=vit_layers,channels=init_chan,mlp_ratio=mlp_ratio,time_dim=time_dim,context_dims=context_dims)
+			self.decoder = GuidedDenoisingViTDecoder(cnn_layers=cnn_layers,vit_layers=vit_layers,channels=init_chan,mlp_ratio=mlp_ratio,time_dim=time_dim,context_dims=context_dims)
 
-		# final 1x1 classifier
-		self.out_layer = nn.Conv2d(init_chan_diff,mask_channels,kernel_size=1,bias=True)
+		# final 1x1 -- predicted noise on the mask channels
+		self.out_layer = nn.Conv2d(init_chan,mask_channels,kernel_size=1,bias=True)
 
 	def forward(self,x_t,t,vnir_image):
-		t_emb   = self.time_embedder(t)
-		context = self.cond_encoder(vnir_image)
+		t_emb   = self.time_embedder(t) # t: [B] long timesteps
+		context = self.cond_encoder(vnir_image) # ([c1,c2,c3,c4],c5)
 
 		x             = self.in_layer(x_t)
 		skips,enc_out = self.encoder(x,t_emb,context)

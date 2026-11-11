@@ -102,19 +102,25 @@ trap on_exit EXIT
 # kubectl delete SENDS SIGTERM: EXIT THROUGH on_exit SO THE .failed MARKER IS WRITTEN
 trap 'exit 143' TERM INT
 
-# COPY THE LATEST BT CHECKPOINT FOR THIS ROW -- THE TRAINING SCRIPT READS IT FROM --net-dir
-BT_ID_PADDED=$(printf "%03d" "$(hp_get bt_id)")
-BT_CKPTS=("${MODEL_PVC}/${BT_RUN}/bt_${BT_ID_PADDED}_e"*.pth.tar)
-[ -f "${BT_CKPTS[-1]}" ] || { echo "No bt_${BT_ID_PADDED}_e*.pth.tar in ${MODEL_PVC}/${BT_RUN}"; exit 1; }
-cp -v "${BT_CKPTS[-1]}" "$NET_DIR/"
-STAGED+=("${NET_DIR}/$(basename "${BT_CKPTS[-1]}")")
+# COPY THE LATEST BT CHECKPOINT FOR THIS ROW, ONLY IF IT INITIALIZES THE CONDITION ENCODER
+# (hp['cond_init'] == 'bt'; DEFAULT 'scratch', SAME AS train_full.py) -- READ FROM --net-dir
+if [ "$(hp_get cond_init scratch)" = "bt" ]; then
+  BT_ID_PADDED=$(printf "%03d" "$(hp_get bt_id)")
+  BT_CKPTS=("${MODEL_PVC}/${BT_RUN}/bt_${BT_ID_PADDED}_e"*.pth.tar)
+  [ -f "${BT_CKPTS[-1]}" ] || { echo "No bt_${BT_ID_PADDED}_e*.pth.tar in ${MODEL_PVC}/${BT_RUN}"; exit 1; }
+  cp -v "${BT_CKPTS[-1]}" "$NET_DIR/"
+  STAGED+=("${NET_DIR}/$(basename "${BT_CKPTS[-1]}")")
+fi
 
-# COPY THE LATEST PRE-TRAINED DENOISER CHECKPOINT FOR THIS ROW (hp['diff_id'], ELSE hp['id'])
-DIFF_ID_PADDED=$(printf "%03d" "$(hp_get diff_id)")
-DIFF_CKPTS=("${MODEL_PVC}/${DIFF_RUN}/"*_"${DIFF_ID_PADDED}_e"*.pth.tar)
-[ -f "${DIFF_CKPTS[-1]}" ] || { echo "No *_${DIFF_ID_PADDED}_e*.pth.tar in ${MODEL_PVC}/${DIFF_RUN}"; exit 1; }
-cp -v "${DIFF_CKPTS[-1]}" "$NET_DIR/"
-STAGED+=("${NET_DIR}/$(basename "${DIFF_CKPTS[-1]}")")
+# COPY THE LATEST PRE-TRAINED DENOISER CHECKPOINT FOR THIS ROW (hp['diff_id'], ELSE hp['id']),
+# ONLY IF IT INITIALIZES THE DENOISER (hp['diff_init'] == 'pretrain'; DEFAULT 'scratch')
+if [ "$(hp_get diff_init scratch)" = "pretrain" ]; then
+  DIFF_ID_PADDED=$(printf "%03d" "$(hp_get diff_id)")
+  DIFF_CKPTS=("${MODEL_PVC}/${DIFF_RUN}/"*_"${DIFF_ID_PADDED}_e"*.pth.tar)
+  [ -f "${DIFF_CKPTS[-1]}" ] || { echo "No *_${DIFF_ID_PADDED}_e*.pth.tar in ${MODEL_PVC}/${DIFF_RUN}"; exit 1; }
+  cp -v "${DIFF_CKPTS[-1]}" "$NET_DIR/"
+  STAGED+=("${NET_DIR}/$(basename "${DIFF_CKPTS[-1]}")")
+fi
 
 # BACKGROUND + wait: BASH DEFERS TRAPS UNTIL A FOREGROUND COMMAND RETURNS, BUT
 # wait IS INTERRUPTED BY THEM. wait $! STILL RETURNS THE PIPEFAIL STATUS.
