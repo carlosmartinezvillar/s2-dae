@@ -1,4 +1,5 @@
 import os
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -166,12 +167,14 @@ if __name__ == '__main__':
 		{'params':no_decay_params,'weight_decay':0.0}],
 		lr=hp['lrate'])
 
-	# SCHEDULER -- COSINE ANNEALING W/O RESTARTS
+	# SCHEDULER -- LINEAR WARMUP + COSINE ANNEALING W/O RESTARTS
+	# AS A FACTOR ON EACH GROUP'S OWN LRATE (SAME FORM AS THE OTHER TRAINING SCRIPTS)
 	warmup_steps = 10
 	cosine_steps = hp['epochs']-warmup_steps
-	min_rate = hp['lrate'] / cosine_steps
+	min_factor = 1.0 / cosine_steps
+	cosine_factor = lambda e: min_factor + (1.0-min_factor) * 0.5 * (1.0 + math.cos(math.pi * min(e,cosine_steps) / cosine_steps))
 	warmup_sched = torch.optim.lr_scheduler.LinearLR(optimizer,start_factor=1e-2,end_factor=1.0,total_iters=warmup_steps)
-	cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,T_max=cosine_steps,eta_min=min_rate)
+	cosine_sched = torch.optim.lr_scheduler.LambdaLR(optimizer,lr_lambda=cosine_factor)
 	scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer,schedulers=[warmup_sched,cosine_sched],milestones=[warmup_steps])
 
 	bands,_ = dataloader.load_cached_split(args.data_dir,split='training')
