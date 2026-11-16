@@ -36,7 +36,7 @@ print(row.get(sys.argv[3],sys.argv[4] if len(sys.argv) > 4 else row["id"]))
 }
 
 # RUN WHOSE CHECKPOINTS HOLD THE PRE-TRAINED BT ENCODERS (A bt_pretrain.sh OUTPUT):
-# hp['bt_run'] IF SET (e.g. bt_pretrain_long), ELSE THE bt_pretrain SWEEP
+# hp['bt_run'] IF SET (e.g. bt_pretrain_final), ELSE THE bt_pretrain SWEEP
 BT_RUN="$(hp_get bt_run bt_pretrain)"
 # RUN WHOSE CHECKPOINTS HOLD THE PRE-TRAINED DENOISERS (diff_pretrain.sh OUTPUT)
 DIFF_RUN="diff_pretrain"

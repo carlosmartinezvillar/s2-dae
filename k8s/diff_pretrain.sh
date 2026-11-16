@@ -35,8 +35,8 @@ print(row.get(sys.argv[3],sys.argv[4] if len(sys.argv) > 4 else row["id"]))
 }
 
 # RUN WHOSE CHECKPOINT HOLDS THE METRIC ENCODER (A bt_pretrain.sh OUTPUT):
-# hp['bt_run'] IF SET, ELSE bt_pretrain_final (THE BEST bt_probe ENCODER TRAINED LONG)
-BT_RUN="$(hp_get bt_run bt_pretrain_final)"
+# hp['bt_run'] IF SET, ELSE THE bt_pretrain SWEEP (CNN 076, THE BEST bt_probe ENCODER)
+BT_RUN="$(hp_get bt_run bt_pretrain)"
 
 MODEL_OUT_DIR="${MODEL_PVC}/${RUN_NAME}"
 LOG_OUT_DIR="${LOG_PVC}/${RUN_NAME}"

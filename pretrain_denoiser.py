@@ -232,7 +232,8 @@ def load_encoder_checkpoint(bt_id,bt_run,epoch=None):
 		init_chan=bt_hp['init_chan'],
 		cnn_layers=bt_hp['cnn_layers'],
 		proj_dim=bt_hp['proj_dim'],
-		encoder=bt_hp.get('encoder','cnn')
+		encoder=bt_hp.get('encoder','cnn'),
+		vit_layers=bt_hp.get('vit_layers',1) # FROM THE BT ROW, NOT hp (hp['vit_layers'] IS THE DENOISER'S)
 	)
 	bt_net.load_state_dict(checkpoint['model_state_dict'],strict=True)
 	print(f"Loaded metric encoder from {path} (epoch {checkpoint['epoch']}, {bt_hp.get('encoder','cnn')}, init_chan {bt_hp['init_chan']})")
@@ -522,7 +523,7 @@ if __name__ == '__main__':
 	optimizer = torch.optim.AdamW(param_groups,lr=lrate,fused=device.type == 'cuda') # single fused kernel for the whole update
 
 	# AN AUXILIARY FIXED ENCODER TO PRODUCE AN UNBIASED SET OF FEATURES THROUGHOUT TRAINING 
-	encoder = load_encoder_checkpoint(hp.get('bt_id'),hp.get('bt_run','bt_pretrain_final'))
+	encoder = load_encoder_checkpoint(hp.get('bt_id'),hp.get('bt_run','bt_pretrain'))
 	encoder = encoder.to(device)
 	encoder = torch.compile(encoder)
 

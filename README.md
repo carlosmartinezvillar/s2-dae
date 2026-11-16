@@ -82,13 +82,18 @@ The experiments were run on the [NSF National Research Platform](https://nationa
 # 2. Probe every pretrained encoder (frozen encoder, decoder only)
 ./k8s/kube_launcher.sh bt_probe ./hpo/bt_probe.json 0 239
 
-# 3. Pretrain the best encoder from the probe for 1,000 epochs (here: id 7)
-python3 -c "import sys; sys.path.insert(0,'hpo'); import experiments as e; e.set_experiments_bt_pretrain_long(7)"
-./k8s/kube_launcher.sh bt_pretrain ./hpo/bt_pretrain_long.json 7 7
+# 3. Second sweep zoomed in on the ranges that worked in 1-2, on the base_train encoder grid
+#    (CNN/ViT x width 32/64 x ViT depth 1/2, projector dim 4096; 120 runs, 500 epochs), then probe it
+python3 hpo/experiments.py
+./k8s/kube_launcher.sh bt_pretrain ./hpo/bt_pretrain_final.json 0 119
+./k8s/kube_launcher.sh bt_probe ./hpo/bt_probe_final.json 0 119
+python3 results.py --probe-dir <bt_probe_final logs> --params ./hpo/bt_pretrain_final.json
 
-# 4. Fine-tune encoder + decoder end to end from that checkpoint
-python3 -c "import sys; sys.path.insert(0,'hpo'); import experiments as e; e.set_experiments_bt_train(7)"
-./k8s/kube_launcher.sh bt_train ./hpo/bt_train.json 0 39
+# 4. Fine-tune encoder + decoder end to end from the best CNN and ViT encoders of step 3
+#    (here: rows A and B), each with a CNN and a ViT decoder, encoder lr ratio 0.1/0.5/1.0, batch 32
+#    (30 random learning rate / weight decay samples per combination)
+python3 -c "import sys; sys.path.insert(0,'hpo'); import experiments as e; e.set_experiments_bt_train(bt_ids=(A, B), bt_run='bt_pretrain_final')"
+./k8s/kube_launcher.sh bt_train ./hpo/bt_train.json 0 359
 ```
 
 Before submitting, the launcher checks that the working tree matches the pushed remote, because pods clone the remote and not your local copy. Prefix any launch with `DRY_RUN=1` to print the manifests without submitting. Sweep definitions live in `hpo/experiments.py`:
@@ -98,6 +103,9 @@ Before submitting, the launcher checks that the working tree matches the pushed 
 | `base_train.json` | 280 | encoder ∈ {CNN, ViT} × decoder ∈ {CNN, ViT} × width × ViT depth × batch size, random learning rate and weight decay |
 | `bt_pretrain.json` | 240 | encoder ∈ {CNN, ViT} × projector dim ∈ {2048, 4096, 8192} × width ∈ {32, 48}, 20 random samples each |
 | `bt_probe.json` | 240 | one probe per pretrained encoder, with fixed probe settings so scores are comparable |
+| `bt_pretrain_final.json` | 120 | encoder ∈ {CNN, ViT} × width ∈ {32, 64} × ViT depth ∈ {1, 2} (ViT only), projector dim 4096, 20 random samples each over ranges narrowed from `bt_pretrain.json` |
+| `bt_probe_final.json` | 120 | probe of each `bt_pretrain_final` encoder |
+| `bt_train.json` | 360 | best BT encoder ∈ {CNN, ViT} × decoder ∈ {CNN, ViT} × encoder lr ratio ∈ {0.1, 0.5, 1.0}, batch 32, 30 random learning rate / weight decay samples each |
 
 ## Repository layout
 

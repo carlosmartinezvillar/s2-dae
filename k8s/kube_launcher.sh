@@ -37,7 +37,7 @@
 #   DRY_RUN=1 ./k8s/kube_launcher.sh bt_pretrain ./hpo/bt_pretrain.json 0 1   # inspect two manifests
 #   ./k8s/kube_launcher.sh bt_pretrain ./hpo/bt_pretrain.json 120 239         # ViT rows only
 #   ./k8s/kube_launcher.sh bt_probe ./hpo/bt_probe.json 0 239                 # probe every BT encoder
-#   ./k8s/kube_launcher.sh bt_train ./hpo/bt_train.json 0 39                  # fine-tune one BT encoder
+#   ./k8s/kube_launcher.sh bt_train ./hpo/bt_train.json 0 359                 # fine-tune BT encoders 076/193
 #
 # Useful follow-ups:
 #   kubectl get jobs | grep bt-pretrain                 # status

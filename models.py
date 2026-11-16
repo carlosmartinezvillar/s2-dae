@@ -838,19 +838,20 @@ class BarlowTwinsLoss(nn.Module):
 
 
 class BarlowTwins(nn.Module):
-	def __init__(self,model_id,init_chan=32,cnn_layers=2,proj_dim=8192,encoder='cnn'):
+	def __init__(self,model_id,init_chan=32,cnn_layers=2,proj_dim=8192,encoder='cnn',vit_layers=1):
 		super().__init__()
 
 		# META
 		self.model_name = "S2BT"
 		self.model_id = model_id
 
-		# ENCODER
+		# ENCODER -- vit_layers: ViT LAYERS PER ViT STAGE (vit ONLY; DEFAULT 1 = THE bt_pretrain CHECKPOINTS)
 		assert encoder in ["cnn","vit"]
 		if encoder == 'cnn':
 			self.encoder = ConditionCNNEncoder(channels=init_chan,cnn_layers=cnn_layers)
 		if encoder == 'vit':
-			self.encoder = ConditionViTEncoder(channels=init_chan,cnn_layers=cnn_layers,mlp_ratio=4)
+			assert vit_layers >= 1, f"ViT encoder needs vit_layers >= 1, got {vit_layers}"
+			self.encoder = ConditionViTEncoder(channels=init_chan,cnn_layers=cnn_layers,vit_layers=vit_layers,mlp_ratio=4)
 
 		# PROJECTOR
 		self.rep_dim = init_chan*16 #5 stages, 4 downsamplings doubling C -> c5 has init_chan*16
@@ -1093,12 +1094,23 @@ class ConditionedDenoiser(nn.Module):
 
 
 class BTSegmenter(nn.Module):
-	def __init__(self,model_id,encoder,cnn_layers=2):
+	'''
+	Pre-trained BT encoder + segmentation decoder: 'cnn' (BaseCNNSegDecoder) or 'vit' (BaseViTSegDecoder,
+	vit_layers ViT layers per ViT stage). The probe always uses the default 'cnn'.
+	'''
+	def __init__(self,model_id,encoder,decoder='cnn',cnn_layers=2,vit_layers=1,mlp_ratio=4):
 		super().__init__()
 		self.model_id = model_id
 		self.encoder = encoder
+
 		# DECODER WIDTH FOLLOWS THE ENCODER'S init_chan SO SKIP CHANNELS MATCH
-		self.decoder = BaseCNNSegDecoder(channels=encoder.in_layer.out_channels,cnn_layers=cnn_layers)
+		channels = encoder.in_layer.out_channels
+		assert decoder in ["cnn","vit"], f"Unknown decoder '{decoder}'"
+		if decoder == 'cnn':
+			self.decoder = BaseCNNSegDecoder(channels=channels,cnn_layers=cnn_layers)
+		if decoder == 'vit':
+			assert vit_layers >= 1, f"ViT decoder needs vit_layers >= 1, got {vit_layers}"
+			self.decoder = BaseViTSegDecoder(channels=channels,cnn_layers=cnn_layers,vit_layers=vit_layers,mlp_ratio=mlp_ratio)
 
 	def forward(self,x):
 		skips,x = self.encoder(x) # skips = [c1,c2,c3,c4], x = c5

@@ -153,7 +153,8 @@ if __name__ == '__main__':
 		init_chan=hp['init_chan'],
 		cnn_layers=hp['cnn_layers'],
 		proj_dim=hp['proj_dim'],
-		encoder=hp.get('encoder','cnn')
+		encoder=hp.get('encoder','cnn'),
+		vit_layers=hp.get('vit_layers',1) # bt_pretrain ROWS HAVE NO vit_layers -> 1
 	).to(device)
 	bt_net = torch.compile(bt_net)
 

@@ -89,7 +89,8 @@ def load_encoder_checkpoint(hp,epoch=None):
 		init_chan=hp['init_chan'],
 		cnn_layers=hp['cnn_layers'],
 		proj_dim=hp['proj_dim'],
-		encoder=hp.get('encoder','cnn')
+		encoder=hp.get('encoder','cnn'),
+		vit_layers=hp.get('vit_layers',1) # bt_train ROWS COPY IT FROM THE BT ROW FOR A ViT ENCODER
 	)
 	bt_net.load_state_dict(checkpoint['model_state_dict'],strict=True)
 
@@ -269,7 +270,14 @@ if __name__ == '__main__':
 	bt_encoder = load_encoder_checkpoint(hp)
 
 	# LOAD SEGMENTATION NETWORK (BT Encoder + Probe)
-	seg_net =  models.BTSegmenter(hp['id'],bt_encoder)
+	# DECODER FROM THE FINE-TUNING ROW; BT ROWS (PROBE) HAVE NO 'decoder', SO THE PROBE STAYS ON THE CNN DECODER
+	seg_net =  models.BTSegmenter(
+		hp['id'],
+		bt_encoder,
+		decoder=hp.get('decoder','cnn'),
+		cnn_layers=hp['cnn_layers'],
+		vit_layers=hp.get('vit_layers',1)
+	)
 	seg_net.to(device)
 
 	if args.probe_only:
