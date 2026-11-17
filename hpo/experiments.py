@@ -184,7 +184,7 @@ def set_experiments_bt_train(bt_ids=(76, 193), decoders=('cnn', 'vit'), enc_rati
         bt_rows = {row['id']: row for row in map(json.loads, fp) if row}
 
     space = {
-        'base_lrate': ('log', 5e-5, 4e-4),       # lr at batch 16; base_train: 14 of top 15 in 6e-5..2.4e-4, median drops above 4e-4; probe 2e-4 @ batch 32 = 1.4e-4
+        'base_lrate': ('log', 5e-5, 3e-4),       # lr at batch 16 (lrate <= 4.2e-4 at batch 32); base_train: plateau below ~5e-4 lrate, every pair with a ViT part collapses above ~5e-4-8e-4; probe 2e-4 @ batch 32 = 1.4e-4
         'decay':      ('log', 1e-4, 3e-2),       # decoupled AdamW decay; norm weights/biases excluded
     }
 
